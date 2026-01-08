@@ -7,6 +7,8 @@ pub struct RmDims {
     pub axes: Vec<isize>,
 }
 
+
+
 impl RmDims {
     fn compute_shape<D: DimLike>(&self, input: &[D]) -> TVec<D> {
         let axes = self
@@ -27,6 +29,7 @@ impl Expansion for RmDims {
     fn name(&self) -> StaticName {
         "RmDims".into()
     }
+
 
     fn rules<'r, 'p: 'r, 's: 'r>(
         &'s self,
@@ -65,7 +68,9 @@ impl Expansion for RmDims {
             .sorted()
             .rev();
         for axis in axes {
-            wire = target.wire_node(format!("{prefix}.axis-{axis}"), AxisOp::Rm(axis), &[wire])?[0];
+            wire =
+                target.wire_node(format!("{prefix}.axis-{axis}"), AxisOp::Rm(axis), &[wire])?
+                    [0];
         }
         Ok(tvec!(wire))
     }

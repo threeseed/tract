@@ -45,7 +45,7 @@ impl<'mb> ModelBuilder<'mb> {
     fn translate(&mut self) -> TractResult<()> {
         let mut scenario_specs = vec![];
         'ext: for ext in &self.proto_model.doc.extension {
-            match &*ext.0.0 {
+            match &*ext.0 .0 {
                 "tract_registry" => {
                     let registry = Identifier(ext.1.trim().to_owned());
                     if self.framework.registries.iter().any(|reg| reg.id == registry) {
@@ -367,9 +367,7 @@ impl ResolvedInvocation<'_> {
                 if !b {
                     Ok(None)
                 } else {
-                    bail!(
-                        "Bool(true) not expected for optional values, you might want to access a boolean direclty."
-                    )
+                    bail!("Bool(true) not expected for optional values, you might want to access a boolean direclty.")
                 }
             }
             _ => v
@@ -482,16 +480,11 @@ impl RValue {
                 } else if let Some(sym) = builder.model.symbols.get(&id.0) {
                     Ok(Value::Dim(sym.into()))
                 } else if builder.allow_new_symbol {
-                    warn!(
-                        "Introducing symbol {id:?} without forward declaration (\"extension tract_symbol ...\"). May be deprecated soon."
-                    );
+                    warn!("Introducing symbol {id:?} without forward declaration (\"extension tract_symbol ...\"). May be deprecated soon.");
                     let sym = builder.model.symbols.sym(&id.0);
                     Ok(Value::Dim(sym.into()))
                 } else {
-                    bail!(
-                        "Can not resolve {:?}. Not a known identifier, and symbol introduction is forbidden out of \"external\" shape field",
-                        id
-                    );
+                    bail!("Can not resolve {:?}. Not a known identifier, and symbol introduction is forbidden out of \"external\" shape field", id);
                 }
             }
             RValue::Invocation(inv) => builder
@@ -687,13 +680,9 @@ impl CoerceFrom<Value> for OutletId {
                     let outlet = OutletId::coerce(builder, i)?;
                     outlets.push(builder.wire_as_outlets(AxisOp::Add(0), &[outlet])?[0]);
                 }
-                if inputs.len() > 0 {
-                    builder
-                        .wire_as_outlets(tract_core::ops::array::TypedConcat::new(0), &outlets)
-                        .map(|o| o[0])
-                } else {
-                    builder.add_const(tensor1::<f32>(&[]))
-                }
+                builder
+                    .wire_as_outlets(tract_core::ops::array::TypedConcat::new(0), &outlets)
+                    .map(|o| o[0])
             }
             Value::String(s) => builder.add_const(rctensor0(s.clone())),
             Value::Bool(b) => builder.add_const(rctensor0(*b)),

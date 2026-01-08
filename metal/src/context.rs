@@ -4,7 +4,7 @@ use crate::kernels::{LibraryContent, LibraryName};
 use crate::tensor::{MValue, MetalTensor};
 
 use metal::NSUInteger;
-use tract_core::tract_linalg::block_quant::BlockQuantFact;
+use tract_core::tract_linalg::block_quant::{BlockQuantFact, BlockQuantValue};
 use tract_gpu::device::{DeviceBuffer, DeviceContext};
 use tract_gpu::tensor::{DeviceTensor, OwnedDeviceTensor};
 use tract_gpu::utils::as_q40_tensor;
@@ -177,11 +177,9 @@ impl DeviceContext for MetalContext {
             "Tensor of {:?} is not copied. No device buffer can be allocated for it.",
             view.datum_type(),
         );
-        let bqv = as_q40_tensor(view.tensor);
-
-        let (data_bytes, bqf) = bqv
-            .map(|bqv| (bqv.value.as_bytes(), Some(bqv.fact.clone().into())))
-            .unwrap_or((view.tensor.as_bytes(), None));
+        let data_bytes = as_q40_tensor(view.tensor)
+            .map(|bqv| bqv.value.as_bytes())
+            .unwrap_or(view.tensor.as_bytes());
 
         // Handle empty data
         static ZERO: [u8; 1] = [0];
@@ -196,11 +194,9 @@ impl DeviceContext for MetalContext {
                 None,
             ),
         };
-
         Ok(Box::new(MetalTensor {
             inner: MValue::Natural(tensor.into_arc_tensor()),
             device_buffer,
-            opaque_fact: bqf,
         }))
     }
 
@@ -229,7 +225,7 @@ impl DeviceContext for MetalContext {
                         .unwrap(),
                 )
             };
-            let value = BlobWithFact { fact: Box::new(bqf.clone()), value: Arc::new(blob) };
+            let value = BlockQuantValue { fact: bqf.clone(), value: Arc::new(blob) };
             let tensor = tensor0(Opaque(Arc::new(value)));
             self.tensor_to_device(tensor.into())
         } else {

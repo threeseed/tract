@@ -3,8 +3,8 @@ use criterion::*;
 use tract_data::internal::*;
 use tract_linalg::mmm::{FusedSpec, MMMInputValue, MatMatMul};
 
-use DatumType::*;
 use tract_linalg::mmm::AsInputValue;
+use DatumType::*;
 
 pub fn packed_packed(c: &mut Criterion, name: &str, m: usize, k: usize, n: usize) {
     let mut group = c.benchmark_group(format!("{name}/packed_packed"));

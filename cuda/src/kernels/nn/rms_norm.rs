@@ -1,9 +1,11 @@
 use crate::context::{TractCudaStream, cuda_context};
-use crate::kernels::launch_args::TractLaunchArgs;
-use crate::kernels::{LibraryName, MAX_THREADS, WARP_SIZE, get_cuda_view, utils};
+use crate::kernels::launch_args::LaunchArgsExt;
+use crate::kernels::{LibraryName, MAX_THREADS, get_cuda_view, utils};
 use cudarc::driver::{CudaStream, LaunchConfig, PushKernelArg};
 use tract_core::internal::*;
 use tract_gpu::tensor::DeviceTensor;
+
+static WARP_SIZE: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RmsNorm;
@@ -56,24 +58,30 @@ impl RmsNorm {
         let o_view = get_cuda_view(output);
 
         let func = cuda_context().load_pipeline(LibraryName::NN, kernel_name)?;
-        let mut launch_args = TractLaunchArgs::new(stream, &func);
-        launch_args.push_view(&i_view);
-        launch_args.push_view(&o_view);
-        launch_args.push_slice_i32(&shape_nd3);
-        launch_args.push_slice_i32(&strides_nd3);
-        launch_args.push::<f32>(*eps.to_scalar::<f32>()?);
+        let mut launch_args = stream.launch_builder(&func);
+        launch_args.arg(&i_view);
+        launch_args.arg(&o_view);
+        launch_args.set_slice(&shape_nd3);
+        launch_args.set_slice(&strides_nd3);
+        if input.datum_type() == DatumType::F32 {
+            launch_args.arg(eps.to_scalar::<f32>()?)
+        } else {
+            launch_args.arg(eps.to_scalar::<f16>()?)
+        };
 
         let cfg = LaunchConfig {
             grid_dim: ((shape_nd3[2] * shape_nd3[0]) as _, 1, 1),
             block_dim: if shape_nd3[1] < MAX_THREADS {
-                (WARP_SIZE as _, 1, 1)
+                (WARP_SIZE, 1, 1)
             } else {
                 (MAX_THREADS as _, 1, 1)
             },
             shared_mem_bytes: 0,
         };
 
-        launch_args.launch(cfg)
+        unsafe { launch_args.launch(cfg) };
+
+        Ok(())
     }
 }
 
@@ -112,7 +120,7 @@ mod tests {
             )?
             .into_device()?;
 
-            let eps = Arc::new(tensor0(0.0001f32));
+            let eps = Arc::new(tensor0(0.0001f32.as_()));
             let cpu_rms = rms_norm::RmsNorm { axis, eps: Arc::clone(&eps) };
 
             let cpu_output =
@@ -205,7 +213,7 @@ mod tests {
                     let input = (0..shape.iter().product::<usize>())
                         .map(|f| f.as_() / 1000.as_())
                         .collect::<Vec<_>>();
-                    Self { shape, axis, input, eps: Arc::new(tensor0(0.0001f32)) }
+                    Self { shape, axis, input, eps: Arc::new(tensor0(0.0001f32.as_())) }
                 })
                 .boxed()
         }

@@ -255,6 +255,7 @@ impl Onnx {
         let graph =
             proto.graph.as_ref().ok_or_else(|| anyhow!("model proto does not contain a graph"))?;
         debug!("ONNX operator set version: {onnx_operator_set_version:?}");
+        debug!("ONNX operations in registry: {:?}", self.op_register.0.keys().collect::<Vec<_>>());
         if onnx_operator_set_version != 0 && !(9..19).contains(&onnx_operator_set_version) {
             warn!(
                 "ONNX operator for your model is {onnx_operator_set_version}, tract is only tested against \

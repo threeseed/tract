@@ -8,7 +8,7 @@ use super::PatchAxis;
 use std::fmt::Debug;
 use std::ops::Range;
 
-use tract_itertools::{Itertools, izip};
+use tract_itertools::{izip, Itertools};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PatchSpec {

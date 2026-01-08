@@ -7,6 +7,8 @@ pub struct AddDims {
     pub axes: Vec<isize>,
 }
 
+
+
 impl AddDims {
     pub fn output_shape<D: DimLike>(&self, input: &[D]) -> TVec<D> {
         let rank = input.len() as isize;
@@ -32,6 +34,7 @@ impl Expansion for AddDims {
     fn info(&self) -> TractResult<Vec<String>> {
         Ok(vec![format!("Axes: {:?}", self.axes)])
     }
+
 
     fn rules<'r, 'p: 'r, 's: 'r>(
         &'s self,
@@ -63,7 +66,8 @@ impl Expansion for AddDims {
             .map(|&axis| if axis < 0 { axis + output_rank } else { axis } as usize)
             .sorted();
         for axis in axes {
-            wire = model.wire_node(format!("{prefix}.axis-{axis}"), AxisOp::Add(axis), &wire)?;
+            wire =
+                model.wire_node(format!("{prefix}.axis-{axis}"), AxisOp::Add(axis), &wire)?;
         }
         Ok(wire)
     }

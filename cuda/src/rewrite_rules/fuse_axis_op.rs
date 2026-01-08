@@ -8,7 +8,6 @@ fn is_supported_axis_op(op: &CudaAxisOp) -> bool {
     matches!(op.0, AxisOp::Add(_) | AxisOp::Rm(_) | AxisOp::Reshape(..))
 }
 
-// these are operators that can handle arbitrarty strides
 fn can_fuse_move(model: &TypedModel, axis_node: &TypedNode) -> bool {
     model.single_succ(axis_node.id).unwrap().is_some_and(|node| {
         node.op_is::<crate::ops::CudaConcat>()
@@ -18,10 +17,6 @@ fn can_fuse_move(model: &TypedModel, axis_node: &TypedNode) -> bool {
             || node.op_is::<crate::ops::CudaMultiBroadcastTo>()
             || node.op_is::<crate::ops::CudaDynKVCache>()
             || node.op_is::<crate::ops::CudaGgmlQuantQ81>()
-            || node.op_is::<crate::ops::CudaPad>()
-            || node.op_is::<crate::ops::CudaDelay>()
-            || node.op_is::<crate::ops::CudaPulsePad>()
-            || node.op_is::<crate::ops::CudaBinOp>()
     })
 }
 
@@ -52,71 +47,33 @@ pub fn collect_chain_of_axis_ops<'a>(
     })
 }
 
-fn split_succs(
-    model: &TypedModel,
-    axis_node: &TypedNode,
-    axis_node_name: &str,
-    axis_op: &CudaAxisOp,
-) -> TractResult<Option<TypedModelPatch>> {
-    let succs = model.all_succ(axis_node.id)?.context("Expected node with successors")?;
-
-    let mut patch = TypedModelPatch::default();
-    let input = patch.tap_model(model, axis_node.inputs[0])?;
-
-    for (i, succ) in succs.iter().enumerate() {
-        let axis_out =
-            patch.wire_node(format!("{axis_node_name}.{i}"), axis_op.clone(), &[input])?[0];
-
-        let mut op_ins = patch.taps(model, &succ.inputs)?;
-
-        let (idx, _) = succ
-            .inputs
-            .iter()
-            .enumerate()
-            .find(|(_, inlet)| inlet.node == axis_node.id)
-            .context("Axis node not found in its successor inputs")?;
-
-        op_ins[idx] = axis_out;
-
-        let op_outs = patch.wire_node(succ.name.clone(), succ.op.clone(), &op_ins)?;
-        for out in op_outs {
-            patch.shunt_outside(model, succ.id.into(), out)?;
-        }
-    }
-
-    Ok(Some(patch))
+#[macro_export]
+macro_rules! dispatch_cuda_op {
+    ($node: expr, $body:expr, $($op:path),+,) => {
+        $(
+            if let Some(op) = $node.op_as::<$op>() {
+                return $body(op.clone());
+            }
+        )*
+    };
 }
 
 pub fn fuse_axis_op(
     _ctx: &(),
     model: &TypedModel,
     axis_node: &TypedNode,
-    axis_node_name: &str,
+    _axis_node_name: &str,
     axis_op: &CudaAxisOp,
 ) -> TractResult<Option<TypedModelPatch>> {
-    // Only support certain axis ops (or a Move, which is handled specially below)
     rule_ensure!(is_supported_axis_op(axis_op) || matches!(axis_op.0, AxisOp::Move(..)));
 
-    let Some(node) = model.single_succ(axis_node.id)? else {
-        return split_succs(model, axis_node, axis_node_name, axis_op);
-    };
-
-    // Disallow fusing when the successor is already an axis/fused op or a sync,
-    // *unless* it's a Move AxisOp (we allow that via the early-quit branch).
-    let is_axis_like = node.op_is::<CudaAxisOp>() || node.op_is::<CudaFusedAxisOp>();
-    let is_allowed_move =
-        node.op_as::<CudaAxisOp>().is_some_and(|op| matches!(op.0, AxisOp::Move(..)));
-
-    rule_ensure!(!is_axis_like || is_allowed_move);
-
+    let Some(node) = model.single_succ(axis_node.id)? else { return Ok(None) };
     let node_name = &node.name;
+    let Some(in_nodes) = model.all_prec(node.id)? else { return Ok(None) };
 
-    let Some(in_nodes) = model.all_prec(node.id)? else {
-        return Ok(None);
-    };
-
-    let mut grouped_axis_ops: TVec<TVec<CudaAxisOp>> = tvec![];
+    let mut grouped_axis_ops = tvec![];
     let mut tap_inputs = tvec![];
+
     let mut patch = TypedModelPatch::default();
 
     for (in_idx, in_node) in in_nodes.into_iter().enumerate() {
@@ -132,33 +89,52 @@ pub fn fuse_axis_op(
         }
     }
 
-    // If the successor is a Move, we may fuse it now or defer.
+    // Handle all compatible ops.
+    dispatch_cuda_op!(
+        node,
+        |op| {
+            let out = patch.wire_node(
+                format!("{node_name}.fused_axis_op"),
+                CudaFusedAxisOp { grouped_axis_ops, op },
+                &tap_inputs,
+            )?;
+            patch.shunt_outside(model, node.id.into(), out[0])?;
+            Ok(Some(patch))
+        },
+        crate::ops::CudaBinOp,
+        crate::ops::CudaMultiBroadcastTo,
+        crate::ops::CudaUnaryOp,
+        crate::ops::CudaRmsNorm,
+        crate::ops::CudaGeluApproximate,
+        crate::ops::CudaSoftmax,
+        crate::ops::CudaRotateHalf,
+        crate::ops::CudaApplyRope,
+        crate::ops::CudaReduce,
+        crate::ops::CudaSlice,
+        crate::ops::CudaConcat,
+        crate::ops::CudaCast,
+        crate::ops::CudaScaledMaskedSoftmax,
+        crate::ops::CudaGgmlGemm,
+        crate::ops::CudaDynKVCache,
+        crate::ops::CudaGgmlQuantQ81,
+    );
+
+    // Handle AxisOp::Move operator.
     if let Some(op) = node.op_as::<crate::ops::CudaAxisOp>() {
-        if matches!(op.0, AxisOp::Move(..)) {
-            let should_defer_move = !grouped_axis_ops[0].is_empty() && !can_fuse_move(model, node);
-            if should_defer_move {
-                let out = patch.wire_node(
-                    format!("{node_name}.fused_axis_op"),
-                    CudaFusedAxisOp { grouped_axis_ops, op: Box::new(op.clone()) },
-                    &tap_inputs,
-                )?;
-                patch.shunt_outside(model, node.id.into(), out[0])?;
-                return Ok(Some(patch));
-            } else {
-                // Nothing to do right now; we’ll fuse on a later pass.
-                return Ok(None);
-            }
+        // Early quit if MoveAxis will be fused in next calls to rule
+        if matches!(op.0, AxisOp::Move(..))
+            && (!grouped_axis_ops[0].is_empty() && !can_fuse_move(model, node))
+        {
+            let out = patch.wire_node(
+                format!("{node_name}.fused_axis_op"),
+                CudaFusedAxisOp { grouped_axis_ops, op: op.clone() },
+                &tap_inputs,
+            )?;
+            patch.shunt_outside(model, node.id.into(), out[0])?;
+            return Ok(Some(patch));
         }
     }
-
-    // General case: fuse using the successor's op.
-    let out = patch.wire_node(
-        format!("{node_name}.fused_axis_op"),
-        CudaFusedAxisOp { grouped_axis_ops, op: node.op.clone() },
-        &tap_inputs,
-    )?;
-    patch.shunt_outside(model, node.id.into(), out[0])?;
-    Ok(Some(patch))
+    Ok(None)
 }
 
 pub fn fuse_move_axis(

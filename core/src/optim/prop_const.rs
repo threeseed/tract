@@ -55,11 +55,9 @@ impl super::TypedPass for PropConst {
                             if succ.inputs.len() > 1 || !succ.op.is_stateless() {
                                 break;
                             }
-                            let Ok(succ_res) = succ.op.eval_with_session(
-                                node.id,
-                                &SessionState::default(),
-                                res.clone(),
-                            ) else {
+                            let Ok(succ_res) =
+                                succ.op.eval_with_session(node.id, &SessionState::default(), res.clone())
+                            else {
                                 break;
                             };
                             res = succ_res;

@@ -3,12 +3,11 @@ use crate::ser::{BuiltinOp, SubgraphBuilder};
 use crate::tflite::{
     AbsOptions, AbsOptionsArgs, BuiltinOperator, BuiltinOptions, CosOptions, CosOptionsArgs,
     ExpOptions, ExpOptionsArgs, HardSwishOptions, HardSwishOptionsArgs, LeakyReluOptions,
-    LeakyReluOptionsArgs, LogicalNotOptions, LogicalNotOptionsArgs, SquareOptions,
-    SquareOptionsArgs,
+    LeakyReluOptionsArgs, LogicalNotOptionsArgs, SquareOptions, SquareOptionsArgs, LogicalNotOptions,
 };
 use tract_core::internal::*;
 use tract_core::ops::element_wise::ElementWiseOp;
-use tract_core::ops::logic::{not, Not};
+use tract_core::ops::logic::{ Not, not };
 use tract_core::ops::math::*;
 use tract_core::ops::nn::{hard_swish, leaky_relu, sigmoid, HardSwish, LeakyRelu, Sigmoid};
 

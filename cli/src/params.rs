@@ -26,7 +26,7 @@ use tract_tflite::internal::TfliteProtoModel;
 use tract_nnef::ast::dump::Dumper;
 
 use crate::TractResult;
-use tract_cuda::utils::are_culibs_present;
+use tract_cuda::utils::get_cuda_lib;
 use tract_libcli::display_params;
 use tract_libcli::display_params::DisplayParams;
 use tract_libcli::model::Model;
@@ -54,7 +54,11 @@ impl Location {
     }
 
     fn is_dir(&self) -> bool {
-        if let &Location::Fs(p) = &self { p.is_dir() } else { false }
+        if let &Location::Fs(p) = &self {
+            p.is_dir()
+        } else {
+            false
+        }
     }
 
     fn read(&self) -> TractResult<Box<dyn Read>> {
@@ -224,7 +228,7 @@ impl Parameters {
                     #[allow(unused_imports)]
                     use tract_nnef::ast::{LValue, RValue};
                     if let Some(over) = tensors_values
-                        .input_by_name(&name.0)
+                        .by_name(&name.0)
                         .or_else(|| tensors_values.by_input_ix(ix))
                         .and_then(|tv| tv.fact.as_ref())
                     {
@@ -417,8 +421,6 @@ impl Parameters {
                     values: tensor.value.concretize().map(|t| vec![t.into_tensor().into()]),
                     fact: Some(tensor.without_value()),
                     random_range: None,
-                    only_input: is_input,
-                    only_output: is_output,
                 })
             }
         }
@@ -438,6 +440,8 @@ impl Parameters {
                 .map(|(_, _, tensor)| tensor.into_tvalue())
                 .collect();
             result.push(TensorValues {
+                input_index: None,
+                output_index: None,
                 name: Some(name),
                 fact: if get_facts {
                     Some(vals[0].datum_type().fact(vals[0].shape()).into())
@@ -445,7 +449,7 @@ impl Parameters {
                     None
                 },
                 values: if get_values { Some(vals) } else { None },
-                ..TensorValues::default()
+                random_range: None,
             })
         }
         result
@@ -511,11 +515,11 @@ impl Parameters {
                 let input_index = if name.is_some() { None } else { Some(ix) };
                 result.add(TensorValues {
                     input_index,
+                    output_index: None,
                     name,
                     values: fact.value.concretize().map(|t| vec![t.into_tensor().into()]),
                     fact: Some(fact.without_value()),
-                    only_input: true,
-                    ..TensorValues::default()
+                    random_range: None,
                 });
             }
         }
@@ -550,20 +554,19 @@ impl Parameters {
                         fact
                     );
                     result.add(TensorValues {
+                        input_index: None,
                         output_index: Some(ix),
                         name,
                         values: fact.value.concretize().map(|t| vec![t.into_tensor().into()]),
                         fact: Some(fact.without_value()),
-                        only_output: true,
-                        ..TensorValues::default()
+                        random_range: None,
                     });
                 }
             }
 
             if let Some(bundles) = sub.values_of("assert-output-bundle") {
                 for bundle in bundles {
-                    for mut tv in Self::parse_npz(bundle, true, false)? {
-                        tv.only_output = true;
+                    for tv in Self::parse_npz(bundle, true, false)? {
                         result.add(tv);
                     }
                 }
@@ -781,7 +784,7 @@ impl Parameters {
 
         {
             if matches.is_present("cuda") {
-                if are_culibs_present() {
+                if get_cuda_lib().is_some() {
                     stage!("cuda", typed_model -> typed_model, |m:TypedModel| {
                         tract_cuda::CudaTransform.transform_into(m)
                     });
@@ -1034,7 +1037,7 @@ impl Parameters {
         if let Some(infer) = raw_model.downcast_mut::<InferenceModel>() {
             for (ix, node_id) in infer.inputs.iter().enumerate() {
                 let tv = tensors_values
-                    .input_by_name(&infer.node(node_id.node).name)
+                    .by_name(&infer.node(node_id.node).name)
                     .or_else(|| tensors_values.by_input_ix(ix));
                 if let Some(tv) = tv {
                     if let Some(fact) = &tv.fact {

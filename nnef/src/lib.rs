@@ -27,7 +27,7 @@ pub mod internal {
     pub use crate::ast::dump_doc::DocDumper;
     pub use crate::ast::parse::parse_parameters;
     pub use crate::ast::{
-        FragmentDecl, FragmentDef, Identifier, Parameter, RValue, TypeName, param,
+        param, FragmentDecl, FragmentDef, Identifier, Parameter, RValue, TypeName,
     };
     pub use crate::deser::{ModelBuilder, ResolvedInvocation, Value};
     pub use crate::framework::Nnef;
@@ -37,7 +37,7 @@ pub mod internal {
         DatLoader, GraphNnefLoader, GraphQuantLoader, Resource, ResourceLoader, TypedModelLoader,
         TypedModelResource,
     };
-    pub use crate::ser::{IntoAst, invocation, logical, numeric, string};
+    pub use crate::ser::{invocation, logical, numeric, string, IntoAst};
     pub use std::any::TypeId;
     pub use tract_core::internal::*;
 }

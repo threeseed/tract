@@ -68,7 +68,7 @@ impl CausalLlmModel {
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
                 use tract_core::transform::ModelTransform;
-                if tract_cuda::utils::are_culibs_present() {
+                if tract_cuda::utils::get_cuda_lib().is_some() {
                     nn.properties.insert("GPU".into(), rctensor0(true));
                     tract_cuda::CudaTransform.transform(&mut nn)?;
                 }

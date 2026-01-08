@@ -137,9 +137,7 @@ bin_to_super_type!(mul, Mul,
                     *c = (scale_by((a.clone() as i32 - zp as i32) * (*b as i32 - zp as i32) , scale) + zp as i32).clamp_cast()
                    };
                    q_op_on_f32: |a: f32, b: f32| a * b,
-                   [i8, i16, i32, i64, u8, u16, u32, u64] => |c, a, b| *c = a.wrapping_mul(*b),
-                   [f32, f16, f64] => |c, a, b| *c = a * b,
-                   [TDim] => |c, a, b| *c = a.clone() * b
+[f32, i8, i16, i32, i64, u8, u16, u32, u64, f16, f64, TDim] => |c, a, b| *c = a.clone() * b
 );
 
 bin_to_super_type!(div, Div,
@@ -397,19 +395,33 @@ fn declutter_mul_const_mul_const(
     node: &TypedNode,
 ) -> TractResult<Option<TypedModelPatch>> {
     let input_facts = model.node_input_facts(node.id)?;
-    rule_if_some!(const_slot = input_facts.iter().position(|f| f.konst.is_some()));
+    let Some(const_slot) = input_facts.iter().position(|f| f.konst.is_some()) else {
+        return Ok(None);
+    };
     let prec = model.node(node.inputs[1 - const_slot].node);
-    rule_if_some!(prec_mul = prec.op_as::<TypedBinOp>());
-    rule_if!(prec.outputs[0].successors.len() <= 1);
-    rule_if!(prec_mul.0.is::<Mul>());
+    let Some(prec_mul) = prec.op_as::<TypedBinOp>() else {
+        return Ok(None);
+    };
+    if prec.outputs[0].successors.len() > 1 {
+        return Ok(None);
+    };
+    if !prec_mul.0.is::<Mul>() {
+        return Ok(None);
+    }
     let prec_input_facts = model.node_input_facts(prec.id)?;
-    rule_if_some!(prec_const_slot = prec_input_facts.iter().position(|f| f.konst.is_some()));
+    let Some(prec_const_slot) = prec_input_facts.iter().position(|f| f.konst.is_some()) else {
+        return Ok(None);
+    };
 
     let const_fact = model.outlet_fact(node.inputs[const_slot])?;
     let prec_const_fact = model.outlet_fact(prec.inputs[prec_const_slot])?;
     // todo: extend to anything broadcast compatible
-    rule_if!(const_fact.shape.volume().is_one() || prec_const_fact.shape.volume().is_one());
-    rule_if!(const_fact.datum_type.is_float());
+    if !const_fact.shape.volume().is_one() && !prec_const_fact.shape.volume().is_one() {
+        return Ok(None);
+    }
+    if !const_fact.datum_type.is_float() {
+        return Ok(None);
+    }
     let result = mul()
         .eval(tvec!(
             const_fact.konst.clone().unwrap().into_tvalue(),

@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::fmt::Display;
 use tract_core::internal::*;
 
-use crate::device::{DeviceBuffer, get_context};
+use crate::device::DeviceBuffer;
 use crate::utils::check_strides_validity;
 
 use super::OwnedDeviceTensor;
@@ -64,13 +64,21 @@ impl DeviceArenaView {
         self.len
     }
 
-    pub fn as_bytes(&self) -> Vec<u8> {
-        let len = if let Some(of) = &self.opaque_fact {
-            of.mem_size().as_i64().unwrap() as usize
-        } else {
-            self.len() * self.dt.size_of()
-        };
-        self.arena.get_bytes_slice(self.offset_bytes, len)
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.arena.as_arc_tensor().unwrap().as_bytes()
+            [self.offset_bytes..self.offset_bytes + self.len() * self.dt.size_of()]
+    }
+
+    #[inline]
+    pub fn view(&self) -> TensorView<'_> {
+        unsafe {
+            TensorView::from_bytes(
+                self.arena.as_arc_tensor().unwrap(),
+                self.offset_bytes as _,
+                self.shape.as_slice(),
+                self.strides.as_slice(),
+            )
+        }
     }
 
     /// Reshaped tensor with given shape.
@@ -114,35 +122,21 @@ impl DeviceArenaView {
             Ok(self.clone())
         }
     }
-
-    pub fn to_host(&self) -> TractResult<Tensor> {
-        get_context()?.synchronize()?;
-        let content = self.as_bytes();
-        unsafe {
-            if self.dt == DatumType::Opaque {
-                ensure!(self.len == 1, "Expected scalar Opaque");
-                Ok(tensor0(Opaque(Arc::new(BlobWithFact {
-                    fact: self
-                        .opaque_fact
-                        .clone()
-                        .context("Expected Opaque Fact for Opaque ArenaView")?,
-                    value: Arc::new(Blob::from_bytes(&content)?),
-                }))))
-            } else {
-                Tensor::from_raw_dt(self.dt, &self.shape, &content)
-            }
-        }
-    }
 }
 
 impl Display for DeviceArenaView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let content = self
-            .clone()
-            .to_host()
-            .unwrap()
-            .dump(false)
-            .unwrap_or_else(|e| format!("Error : {e:?}"));
+        let content =
+            self.clone().into_tensor().dump(false).unwrap_or_else(|e| format!("Error : {e:?}"));
         write!(f, "DeviceArenaView: {{ {content} }}")
+    }
+}
+
+impl IntoTensor for DeviceArenaView {
+    fn into_tensor(self) -> Tensor {
+        unsafe {
+            Tensor::from_raw_dt(self.dt, &self.shape, self.as_bytes())
+                .expect("Could not transform a DeviceArenaView to tensor")
+        }
     }
 }

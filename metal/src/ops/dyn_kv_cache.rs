@@ -3,7 +3,6 @@ use crate::ops::MetalConcat;
 use derive_new::new;
 use tract_core::internal::*;
 use tract_core::ops::OpStateFreeze;
-use tract_gpu::fact::DeviceTypedFactExt;
 use tract_gpu::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice};
 use tract_transformers::ops::dyn_kv_cache::{DynKeyValueCache, DynKeyValueCacheState};
 
@@ -98,7 +97,7 @@ pub struct FrozenMetalDynKVCacheState {
 }
 
 impl OpStateFreeze for MetalDynKVCacheState {
-    fn freeze(&self) -> Box<dyn FrozenOpState + 'static> {
+    fn freeze(&self) -> Box<(dyn FrozenOpState + 'static)> {
         Box::new(FrozenMetalDynKVCacheState {
             node_id: self.node_id,
             name: self.name.clone(),
@@ -182,7 +181,7 @@ impl TypedOp for MetalDynKVCache {
 
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         ensure!(inputs.len() == 1);
-        let mut facts = tract_gpu::utils::facts_to_device_facts(inputs, |facts| {
+        tract_gpu::utils::facts_to_device_facts(inputs, |facts| {
             let mut fact = facts[0].without_value();
             fact.shape.set(
                 self.axis(),
@@ -191,9 +190,7 @@ impl TypedOp for MetalDynKVCache {
             );
             Ok(tvec!(fact))
         })
-        .with_context(|| format!("Error while computing facts for {:?}", self.name()))?;
-        facts[0].as_device_fact_mut().unwrap().state_owned = true;
-        Ok(facts)
+        .with_context(|| format!("Error while computing facts for {:?}", self.name()))
     }
 }
 

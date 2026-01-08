@@ -1,6 +1,5 @@
 mod apply_rope;
 mod gelu_approximate;
-mod leaky_relu;
 mod reduce;
 mod rms_norm;
 mod scaled_masked_softmax;
@@ -8,7 +7,6 @@ mod softmax;
 
 pub use apply_rope::ApplyRope;
 pub use gelu_approximate::GeluApproximate;
-pub use leaky_relu::LeakyRelu;
 pub use reduce::Reducer;
 pub use rms_norm::RmsNorm;
 pub use scaled_masked_softmax::ScaledMaskedSoftmax;
@@ -76,12 +74,6 @@ pub fn all_functions() -> Vec<String> {
             .into_iter()
             .flat_map(|dt| [true, false].into_iter().map(move |fast_impl| (dt, fast_impl)))
             .flat_map(|(dt, fast_impl)| GeluApproximate { fast_impl }.kernel_name(dt).into_iter()),
-    );
-
-    functions.extend(
-        tract_gpu::tensor::DeviceTensor::SUPPORTED_DT
-            .into_iter()
-            .flat_map(|dt| LeakyRelu.kernel_name(dt).into_iter()),
     );
 
     functions.into_iter().collect()

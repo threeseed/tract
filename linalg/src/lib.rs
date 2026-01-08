@@ -1,3 +1,4 @@
+#![feature(x86_amx_intrinsics)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::redundant_closure_call)]
 #![allow(clippy::len_zero)]
@@ -27,6 +28,8 @@ pub use generic::{ScaleShiftAndRound, Scaler};
 use lazy_static::lazy_static;
 use mmm::{MMMInputFormat, MatMatMul, PanelExtractor};
 use tract_data::internal::TensorView;
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64_avx512;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64_fma;
 

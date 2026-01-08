@@ -1,10 +1,14 @@
 use tract_data::internal::*;
-use tract_data::itertools::{Itertools, izip};
+use tract_data::itertools::{izip, Itertools};
 
 use super::MatMatMul;
 
 fn order_f<F: tract_num_traits::Float>(&a: &F, &b: &F) -> std::cmp::Ordering {
-    if a < b { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }
+    if a < b {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    }
 }
 
 #[derive(Debug)]

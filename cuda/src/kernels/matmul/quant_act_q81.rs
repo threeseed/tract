@@ -7,7 +7,7 @@ use tract_gpu::tensor::DeviceTensor;
 
 use crate::Q40_ROW_PADDING;
 use crate::context::{TractCudaStream, cuda_context};
-use crate::kernels::launch_args::TractLaunchArgs;
+use crate::kernels::launch_args::LaunchArgsExt;
 use crate::kernels::matmul::{MMQ_X_MAX, squeeze_batch_axes};
 use crate::kernels::{LibraryName, get_cuda_view};
 use crate::ops::GgmlQuantQ81Fact;
@@ -66,15 +66,15 @@ impl GgmlQuantQ81 {
             let in_strides = input.strides();
             let fast_path_str = if in_strides[rank - 1] == 1 { "fast_" } else { "" };
             let func = cuda_context().load_pipeline(
-                LibraryName::Quant,
+                LibraryName::GgmlQ,
                 format!("quantize_mmq_q8_1_{fast_path_str}nd{}", input.rank()),
             )?;
-            let mut launch_args = TractLaunchArgs::new(stream, &func);
-            launch_args.push_view(&i_view);
-            launch_args.push_view(&o_view);
-            launch_args.push::<u64>(k);
-            launch_args.push_slice_i32(in_strides);
-            launch_args.push_slice_i32(&out_shape[1..]);
+            let mut launch_args = stream.launch_builder(&func);
+            launch_args.arg(&i_view);
+            launch_args.arg(&o_view);
+            launch_args.arg(&k);
+            launch_args.set_slice(in_strides);
+            launch_args.set_slice(&out_shape[1..]);
 
             let cfg = LaunchConfig {
                 grid_dim: (
@@ -88,13 +88,13 @@ impl GgmlQuantQ81 {
             unsafe { launch_args.launch(cfg) };
         } else {
             let func = context
-                .load_pipeline(LibraryName::Quant, format!("quantize_q8_1_nd{}", input.rank()))?;
-            let mut launch_args = TractLaunchArgs::new(stream, &func);
-            launch_args.push_view(&i_view);
-            launch_args.push_view(&o_view);
-            launch_args.push::<u64>(k);
-            launch_args.push_slice_i32(input.strides());
-            launch_args.push_slice_i32(&out_shape[1..]);
+                .load_pipeline(LibraryName::GgmlQ, format!("quantize_q8_1_nd{}", input.rank()))?;
+            let mut launch_args = stream.launch_builder(&func);
+            launch_args.arg(&i_view);
+            launch_args.arg(&o_view);
+            launch_args.arg(&k);
+            launch_args.set_slice(input.strides());
+            launch_args.set_slice(&out_shape[1..]);
 
             let cfg = LaunchConfig {
                 grid_dim: (padded_k.div_ceil(QUANTIZE_BLOCK_SIZE) as _, m as _, a_batch as _),

@@ -11,7 +11,9 @@ pub fn pull_downsample_over_scan(
     down_node: &TypedNode,
     down_op: &Downsample,
 ) -> TractResult<Option<TypedModelPatch>> {
-    rule_if!(down_op.stride >= 0);
+    if down_op.stride < 0 {
+        return Ok(None);
+    }
 
     // introduce downsample at end of body
     let mut downsampled_body = scan_op.body.clone();
@@ -35,12 +37,13 @@ pub fn pull_downsample_over_scan(
     // check if downsample ops introduced at end have swimmed up to scan inputs during declutter
     for input in downsampled_body.input_outlets()? {
         let input = downsampled_body.node(input.node);
-        rule_if!(
-            input.outputs[0]
-                .successors
-                .iter()
-                .all(|succ| downsampled_body.node(succ.node).op().same_as(down_op))
-        )
+        if input.outputs[0]
+            .successors
+            .iter()
+            .any(|succ| !downsampled_body.node(succ.node).op().same_as(down_op))
+        {
+            return Ok(None);
+        }
     }
 
     let inputs = downsampled_body.input_outlets()?.to_vec();
@@ -103,7 +106,9 @@ pub fn pull_downsample_over_scan(
             *d = down_op.transform_dim(d)
         }
         if let Some((_slot, info)) = &mut output.scan {
-            rule_if!(info.chunk as usize % down_op.stride as usize == 0);
+            if info.chunk as usize % down_op.stride as usize != 0 {
+                return Ok(None);
+            }
             info.chunk = info.chunk.unsigned_abs().divceil(down_op.stride as usize) as isize
                 * info.chunk.signum()
         }

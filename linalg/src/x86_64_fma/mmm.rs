@@ -2,8 +2,20 @@ use crate::Ops;
 use crate::block_quant::*;
 use crate::mmm::ImplementationQuality::ManuallyOptimized;
 use crate::pack::PackedFormat;
+use DatumType::*;
+use tract_data::internal::*;
 
 use super::*;
+
+// Declare which fused specs this backend supports in epilogue.
+// AVX-512 float kernels implement scalar/bin per-row/per-col ops, AddUnicast, AddRowColProducts,
+// leaky-relu, and store. They do not implement integer quantization steps (q_scale/shifts).
+const CAN_FUSE: fn(&FusedSpec) -> bool = |f| {
+    !matches!(
+        f,
+        &FusedSpec::QScale(..) | &FusedSpec::RoundingShiftRight(..) | &FusedSpec::ShiftLeft(..)
+    )
+};
 
 MMMExternKernel!(fma_mmm_f32_8x8 <f32>(8, 8)@(256,4) where(FMA) quality(ManuallyOptimized));
 MMMExternKernel!(fma_mmm_f32_16x6<f32>(16,6)@(256,4) where(FMA) quality(ManuallyOptimized));
@@ -15,37 +27,83 @@ MMMExternKernel!(fma_mmm_f32_64x1<f32>(64,1)@(256,4) where(FMA) quality(Manually
 pub fn pq40_r32() -> PackedBlockQuantFormat {
     PackedBlockQuantFormat::new(&Q4_0, 32, 16, false)
 }
+pub fn pq40_r64() -> PackedBlockQuantFormat {
+    PackedBlockQuantFormat::new(&Q4_0, 64, 16, false)
+}
 MMMExternKernel! {fma_mmm_f32_32x1<f32>(32,1)@(256,4) where(FMA)
     packing[1] = q40f32 => |k| k.with_packing_a(pq40_r32());
-    packing[2] = q40f16 => |k| k.with_packing(pq40_r32(), f16::packing(1));
-    packing[3] = f16f16 => |k| k.with_packing(f16::packing(32), f16::packing(1));
-    packing[4] = f16f32 => |k| k.with_packing(f16::packing(32), f32::packing(1));
-    packing[5] = f32f16 => |k| k.with_packing(f32::packing(32), f16::packing(1));
+    packing[2] = q40f16 => |k| k.with_packing(pq40_r32(), PackedFormat::new(F16, 1, 2));
+    packing[3] = f16f16 => |k| k.with_packing(PackedFormat::new(F16, 32, 32), PackedFormat::new(F16, 1, 2));
     quality(ManuallyOptimized)
     store(f16)
 }
 MMMExternKernel!(fma_mmm_f32_32x3<f32>(32,3)@(256,4) where(FMA)
  packing[1] = f32f16 => |k| k.with_packing(f32::packing(32).align(256), f16::packing(3));
- packing[2] = f16f32 => |k| k.with_packing(f16::packing(32).align(256), f32::packing(3));
- packing[3] = f16f16 => |k| k.with_packing(f16::packing(32).align(256), f16::packing(3));
  quality(ManuallyOptimized)
  store(f16)
 );
 
-MMMExternKernel!(avx512_mmm_f32_128x1<f32>(128, 1)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_16x1 <f32>( 16, 1)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_16x12<f32>( 16,12)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_64x3 <f32>( 64, 3)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_80x2 <f32>( 80, 2)@(512,4) where (AVX512F) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_128x1<f32>(128, 1)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_16x1 <f32>( 16, 1)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_16x12<f32>( 16,12)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_64x3 <f32>( 64, 3)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_80x2 <f32>( 80, 2)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+
+MMMExternKernel!(amx_mmm_bf16_16x16<f32>(16, 16)@(1024,2) where(has_amx_bf16) quality(ManuallyOptimized) store(f16));
+MMMExternKernel!(amx_mmm_bf16_32x32<f32>(32, 32)@(1024,2) where(has_amx_bf16) quality(ManuallyOptimized) store(f16));
+MMMExternKernel!(amx_mmm_bf16_64x16<f32>(64, 16)@(1024,2) where(has_amx_bf16) quality(ManuallyOptimized) store(f16));
+MMMExternKernel!(amx_mmm_bf16_16x64<f32>(16, 64)@(1024,2) where(has_amx_bf16) quality(ManuallyOptimized) store(f16));
+
+MMMExternKernel!(amx_mmm_i8_16x16<i32>(16, 16)@(1024,1) where(has_amx_int8)
+    packing[1] = i8i8 => |k| k.with_packing(PackedFormat::new(DatumType::I8, 16, 64), PackedFormat::new(DatumType::I8, 16, 4));
+    quality(ManuallyOptimized)
+    store(i8)
+);
+MMMExternKernel!(amx_mmm_i8_32x32<i32>(32, 32)@(1024,1) where(has_amx_int8)
+    packing[1] = i8i8 => |k| k.with_packing(PackedFormat::new(DatumType::I8, 32, 64), PackedFormat::new(DatumType::I8, 32, 4));
+    quality(ManuallyOptimized)
+    store(i8)
+);
+MMMExternKernel!(amx_mmm_i8_64x16<i32>(64, 16)@(1024,1) where(has_amx_int8)
+    packing[1] = i8i8 => |k| k.with_packing(PackedFormat::new(DatumType::I8, 64, 64), PackedFormat::new(DatumType::I8, 16, 4));
+    quality(ManuallyOptimized)
+    store(i8)
+);
+
+MMMExternKernel!(amx_mmm_f16_16x16<f32>(16, 16)@(1024,2) where(has_amx_fp16)
+    packing[1] = f16f16 => |k| k.with_packing(PackedFormat::new(F16, 16, 32), PackedFormat::new(F16, 16, 2));
+    quality(ManuallyOptimized)
+    store(f16)
+);
+MMMExternKernel!(amx_mmm_f16_32x32<f32>(32, 32)@(1024,2) where(has_amx_fp16)
+    packing[1] = f16f16 => |k| k.with_packing(PackedFormat::new(F16, 32, 32), PackedFormat::new(F16, 32, 2));
+    quality(ManuallyOptimized)
+    store(f16)
+);
 
 MMMExternKernel! { avx2_mmm_i32_8x8<i32>(8,8)@(256,4) where(AVX2)
     packing[1] = i8i8 => |k| k.with_packing(PackedFormat::new(DatumType::I8, 8, 256), PackedFormat::new(DatumType::I8, 8, 4));
     quality(ManuallyOptimized)
     store(i8)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_amx_bf16() -> bool {
+    is_x86_feature_detected!("amx-bf16")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_amx_int8() -> bool {
+    is_x86_feature_detected!("amx-int8")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_amx_fp16() -> bool {
+    is_x86_feature_detected!("amx-fp16")
 }
 
 pub fn plug(ops: &mut Ops) {

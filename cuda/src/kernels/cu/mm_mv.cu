@@ -1,15 +1,15 @@
-
-#include <cuda_runtime.h>
-#include "common.cuh"
+#include "utils.cuh"
+#include <cuda_fp16.h>
+#include <math.h>
 
 template <typename T, int ncols_dst, int block_size>
 static __device__ void
 mul_mat_vec(const T *__restrict__ x, const T *__restrict__ y,
-            T *__restrict__ dst, const int32_t ncols2, const int32_t nchannels_y,
-            const int32_t stride_row, const int32_t stride_col_y2,
-            const int32_t stride_col_dst, const int32_t channel_ratio,
-            const int32_t stride_channel_x, const int32_t stride_channel_y,
-            const int32_t stride_channel_dst) {
+            T *__restrict__ dst, const int ncols2, const int nchannels_y,
+            const int stride_row, const int stride_col_y2,
+            const int stride_col_dst, const int channel_ratio,
+            const int stride_channel_x, const int stride_channel_y,
+            const int stride_channel_dst) {
   const int row = blockIdx.x;
   const int channel_dst = blockIdx.y;
   const int channel_x = channel_dst / channel_ratio;
@@ -32,7 +32,7 @@ mul_mat_vec(const T *__restrict__ x, const T *__restrict__ y,
 
   float sumf[ncols_dst] = {0.0f};
 
-  if constexpr (cuda::std::is_same_v<T, float>) {
+  if constexpr (std::is_same<T, float>::value) {
     const float2 *x2 = (const float2 *)x;
     const float2 *y2 = (const float2 *)y;
     for (int col2 = tid; col2 < ncols2; col2 += block_size) {
@@ -45,7 +45,7 @@ mul_mat_vec(const T *__restrict__ x, const T *__restrict__ y,
         sumf[j] += tmpx.y * tmpy.y;
       }
     }
-  } else if constexpr (cuda::std::is_same_v<T, half>) {
+  } else if constexpr (std::is_same<T, half>::value) {
     const half2 *x2 = (const half2 *)x;
     const half2 *y2 = (const half2 *)y;
     half2 sumh2[ncols_dst] = {{0.0f, 0.0f}};
@@ -65,7 +65,7 @@ mul_mat_vec(const T *__restrict__ x, const T *__restrict__ y,
       sumf[j] = __low2float(sumh2[j]) + __high2float(sumh2[j]);
     }
   } else {
-    static_assert(cuda::std::is_same_v<T, void>, "unsupported type");
+    static_assert(std::is_same<T, void>::value, "unsupported type");
   }
 
 #pragma unroll
@@ -96,11 +96,11 @@ mul_mat_vec(const T *__restrict__ x, const T *__restrict__ y,
   extern "C" __global__ void                                                   \
       ggml_matvec_##type_name##_ncols_##ncols_dst##_bs_##block_size(           \
           const T *__restrict__ x, const T *__restrict__ y,                    \
-          T *__restrict__ dst, const int32_t ncols2, const int32_t nchannels_y,        \
-          const int32_t stride_row, const int32_t stride_col_y2,                       \
-          const int32_t stride_col_dst, const int32_t channel_ratio,                   \
-          const int32_t stride_channel_x, const int32_t stride_channel_y,              \
-          const int32_t stride_channel_dst) {                                      \
+          T *__restrict__ dst, const int ncols2, const int nchannels_y,        \
+          const int stride_row, const int stride_col_y2,                       \
+          const int stride_col_dst, const int channel_ratio,                   \
+          const int stride_channel_x, const int stride_channel_y,              \
+          const int stride_channel_dst) {                                      \
     mul_mat_vec<T, ncols_dst, block_size>(                                     \
         x, y, dst, ncols2, nchannels_y, stride_row, stride_col_y2,             \
         stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y,     \

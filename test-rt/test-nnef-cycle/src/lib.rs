@@ -63,14 +63,11 @@ mod nnef_cycle {
         fn prepare(&self, model: TypedModel) -> TractResult<Box<dyn Runnable>> {
             info!("Store to NNEF");
             let mut buffer = vec![];
-            // eprintln!("BEFORE NNEF:\n{model}");
-            // dbg!(&model);
+            eprintln!("{model}");
             self.0.write_to_tar(&model, &mut buffer)?;
-            // self.0.write_to_dir(&model, "foo")?;
             info!("Reload from NNEF");
             let reloaded = self.0.model_for_read(&mut &*buffer)?;
-            // eprintln!("RELOADED:\n{}", reloaded.clone().into_decluttered().unwrap());
-            // dbg!(reloaded.clone().into_decluttered());
+            // eprintln!("{}", reloaded.clone().into_decluttered().unwrap());
             Ok(Box::new(Arc::new(reloaded.into_optimized()?.into_runnable()?)))
         }
     }

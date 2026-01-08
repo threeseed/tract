@@ -8,12 +8,9 @@ use tract_itertools::izip;
 #[derive(Debug, Clone, Default)]
 pub struct ConvProblemParams {
     pub no_group: bool,
-    pub no_stride: bool,
     pub no_arbitrary_grouping: bool,
     pub geo_rank: Option<Range<usize>>,
     pub no_batch: bool,
-    pub no_dilations: bool,
-    pub no_bias: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +23,6 @@ pub struct ConvProblem {
     pub bias: Option<ArrayD<f32>>,
     pub pad: PaddingSpec,
     pub strides: TVec<usize>,
-    pub dilations: TVec<usize>,
 }
 
 impl ConvProblem {
@@ -35,7 +31,6 @@ impl ConvProblem {
     }
 
     pub fn reference(&self) -> ArrayD<f32> {
-        // dbg!(self);
         assert_eq!(self.data.shape(), &*self.shape_in.shape, "inconsistent shapes in test");
         let n = *self.shape_in.n().unwrap_or(&1);
         let ci_per_g = self.shape_in.c() / self.group;
@@ -45,50 +40,42 @@ impl ConvProblem {
             KernelFormat::OHWI => self.kernel.shape()[0],
         };
         assert_eq!(self.strides.len(), self.geo_ker().len());
-        assert_eq!(self.dilations.len(), self.geo_ker().len());
         let (shape_out, left_pads): (TVec<_>, TVec<_>) = match &self.pad {
-            PaddingSpec::Valid => {
-                izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides, &self.dilations)
-                    .map(|(i, k, s, d)| {
-                        let kf = (k - 1) * d + 1;
-                        let out = (*i + 1).saturating_sub(kf).divceil(*s);
-                        (out, 0)
-                    })
-                    .unzip()
-            }
-            PaddingSpec::SameUpper => {
-                izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides, &self.dilations)
-                    .map(|(input, k, stride, d)| {
-                        let kf = (k - 1) * d + 1;
-                        let out = input.divceil(*stride);
-                        let pad = ((out - 1) * stride + kf).saturating_sub(*input);
-                        (out, pad / 2)
-                    })
-                    .unzip()
-            }
-            PaddingSpec::SameLower => {
-                izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides, &self.dilations)
-                    .map(|(input, k, stride, d)| {
-                        let kf = (k - 1) * d + 1;
-                        let out = input.divceil(*stride);
-                        let pad = ((out - 1) * stride + kf).saturating_sub(*input);
-                        (out, pad.divceil(2))
-                    })
-                    .unzip()
-            }
+            PaddingSpec::Valid => izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides)
+                .map(|(i, k, s)| {
+                    let out = (*i + 1).saturating_sub(*k).divceil(*s);
+                    (out, 0)
+                })
+                .unzip(),
+            PaddingSpec::SameUpper => izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides)
+                .map(|(input, k, stride)| {
+                    let out = input.divceil(*stride);
+                    let pad = ((out - 1) * stride + k).saturating_sub(*input);
+                    (out, pad / 2)
+                })
+                .unzip(),
+            PaddingSpec::SameLower => izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides)
+                .map(|(input, k, stride)| {
+                    let out = input.divceil(*stride);
+                    let pad = ((out - 1) * stride + k).saturating_sub(*input);
+                    (out, pad.divceil(2))
+                })
+                .unzip(),
             PaddingSpec::Explicit(l, r) => {
-                izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides, &self.dilations, l, r)
-                    .map(|(input, k, stride, d, l, r)| {
-                        let kf = (k - 1) * d + 1;
+                izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides, l, r)
+                    .map(|(input, k, stride, l, r)| {
+                        let dil = 1;
+                        let kf = (k - 1) * dil + 1;
                         let out = (input + l + r).saturating_sub(kf) / *stride + 1;
                         (out, *l)
                     })
                     .unzip()
             }
             PaddingSpec::ExplicitOnnxPool(l, r, ceil) => {
-                izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides, &self.dilations, l, r)
-                    .map(|(input, k, stride, d, l, r)| {
-                        let kf = (k - 1) * d + 1;
+                izip!(self.shape_in.hw_dims(), self.geo_ker(), &self.strides, l, r)
+                    .map(|(input, k, stride, l, r)| {
+                        let dil = 1;
+                        let kf = (k - 1) * dil + 1;
                         let mut out = if *ceil {
                             (input + l + r).saturating_sub(kf).divceil(*stride) + 1
                         } else {
@@ -110,7 +97,6 @@ impl ConvProblem {
             .fmt
             .from_n_c_hw(self.shape_in.n().cloned().unwrap_or(1), co_per_g * self.group, shape_out)
             .unwrap();
-        // dbg!(&shape_out);
         let mut out = ArrayD::zeros(&*shape_out.shape);
         for n in 0..n {
             for g in 0..self.group {
@@ -121,17 +107,12 @@ impl ConvProblem {
                     }
                     output_coords.insert(shape_out.c_axis(), 0);
                     for geo_ker in indices(self.geo_ker()) {
-                        let input_coords: TVec<isize> = izip!(
-                            geo_out.slice(),
-                            geo_ker.slice(),
-                            &left_pads,
-                            &self.strides,
-                            &self.dilations
-                        )
-                        .map(|(out, ker, pad, stride, dil)| {
-                            *out as isize * *stride as isize + (ker * dil) as isize - *pad as isize
-                        })
-                        .collect();
+                        let input_coords: TVec<isize> =
+                            izip!(geo_out.slice(), geo_ker.slice(), &left_pads, &self.strides)
+                                .map(|(out, ker, pad, stride)| {
+                                    *out as isize * *stride as isize + *ker as isize - *pad as isize
+                                })
+                                .collect();
                         if izip!(&input_coords, self.shape_in.hw_dims())
                             .any(|(c, i)| *c < 0 || *c >= *i as isize)
                         {
@@ -201,7 +182,7 @@ impl ConvProblem {
                 self.shape_in.fmt,
                 self.geo_ker().into(),
                 self.pad.clone(),
-                Some(self.dilations.clone()),
+                None,
                 Some(self.strides.clone()),
                 ci,
                 co,
@@ -252,6 +233,7 @@ impl Arbitrary for ConvProblem {
                         ci0 = 1;
                     }
                     let shape_in = df.from_n_c_hw(batch, ci0 * group, data_shape).unwrap();
+                    let data_in = tensor(&*shape_in.shape);
                     match kf {
                         KernelFormat::HWIO => {
                             ker_shape.push(ci0 * group);
@@ -266,62 +248,24 @@ impl Arbitrary for ConvProblem {
                             ker_shape.push(ci0 * group);
                         }
                     };
-                    let hw_rank = shape_in.hw_rank();
-                    let max_stride = if params.no_stride { 1 } else { 3 };
-                    let strides = vec(1usize..=max_stride, hw_rank..=hw_rank);
-                    let max_dil = if params.no_dilations { 1 } else { 3 };
-                    let dilations = vec(1usize..=max_dil, hw_rank..=hw_rank);
-                    (
-                        Just((kf, pad, shape_in, group)),
-                        Just(ker_shape),
-                        Just(co0),
-                        strides,
-                        dilations,
-                    )
-                },
-            )
-            .prop_flat_map(
-                move |((kf, pad, shape_in, group), ker_shape, co0, strides, dilations)| {
+                    let strides = vec(1usize..=3, shape_in.hw_rank()..=shape_in.hw_rank());
                     let kernel = tensor(&ker_shape);
-                    let data = tensor(&*shape_in.shape);
-                    let bias = if params.no_bias {
-                        Just(None).boxed()
-                    } else {
-                        proptest::option::of(tensor(&[co0 * group])).boxed()
-                    };
-
-                    (
-                        Just((kf, pad, shape_in, group)),
-                        data,
-                        kernel,
-                        bias,
-                        Just(strides),
-                        Just(dilations),
-                    )
+                    let bias = proptest::option::of(tensor(&[co0 * group]));
+                    (Just((kf, pad, shape_in, group)), data_in, kernel, bias, strides)
                 },
             )
-            .prop_map(
-                |(
-                    (kernel_format, pad, shape_in, group),
+            .prop_map(|((kernel_format, pad, shape_in, group), data, kernel, bias, strides)| {
+                ConvProblem {
+                    shape_in,
+                    kernel_format,
+                    group,
                     data,
                     kernel,
                     bias,
-                    strides,
-                    dilations,
-                )| {
-                    ConvProblem {
-                        shape_in,
-                        kernel_format,
-                        group,
-                        data,
-                        kernel,
-                        bias,
-                        pad,
-                        strides: strides.into(),
-                        dilations: dilations.into(),
-                    }
-                },
-            )
+                    pad,
+                    strides: strides.into(),
+                }
+            })
             .boxed()
     }
 }
@@ -329,6 +273,7 @@ impl Arbitrary for ConvProblem {
 impl Test for ConvProblem {
     fn run_with_approx(
         &self,
+        _suite: &str,
         id: &str,
         runtime: &dyn Runtime,
         approx: Approximation,
@@ -342,7 +287,6 @@ impl Test for ConvProblem {
         model.properties.insert("tract-rt-test.id".to_string(), rctensor0(id.to_string()));
         let mut output = runtime.prepare(model)?.run(tvec![self.data.clone().into_tvalue()])?;
         let output = output.remove(0).into_tensor();
-        // dbg!(&output);
         output.close_enough(&reference, approx)
     }
 }
@@ -363,7 +307,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -378,7 +321,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
     suite.add(
@@ -392,7 +334,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -407,22 +348,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
-        },
-    );
-
-    suite.add(
-        "ker_3x1",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [3, 3])?,
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: ArrayD::zeros(vec![1, 1, 3, 3]),
-            kernel: ArrayD::zeros(vec![1, 1, 1, 3]),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -437,22 +362,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
-        },
-    );
-
-    suite.add(
-        "nchw_2d_0",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [1, 2])?,
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr4(&[[[[0.0f32, 1.0]]]]).into_dyn(),
-            kernel: arr4(&[[[[0.0f32, 1.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -467,7 +376,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -482,7 +390,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -497,7 +404,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
     suite.add(
@@ -511,7 +417,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
     suite.add(
@@ -528,7 +433,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
     suite.add(
@@ -545,7 +449,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -563,7 +466,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
     suite.add(
@@ -580,7 +482,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -598,7 +499,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
     suite.add(
@@ -612,7 +512,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1, 1),
-            dilations: tvec!(1, 1, 1),
         },
     );
     suite.add(
@@ -627,7 +526,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -642,7 +540,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -657,7 +554,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -672,7 +568,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: Some(ArrayD::<f32>::zeros(vec![4])),
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -687,7 +582,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: Some(arr1(&[0.0, 0.0, 0.0, 1.0]).into_dyn()),
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -702,7 +596,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: Some(ArrayD::<f32>::zeros(vec![1])),
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -717,37 +610,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: Some(arr1(&[0.0f32, 1.0]).into_dyn()),
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
-        },
-    );
-
-    suite.add(
-        "bias_2",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [1, 2])?,
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            kernel: ArrayD::<f32>::zeros(vec![1, 1, 1, 2]),
-            data: ArrayD::<f32>::zeros(vec![1, 1, 1, 2]),
-            bias: Some(arr1(&[1.0]).into_dyn()),
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
-        },
-    );
-
-    suite.add(
-        "bias_dil_0",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [4, 2])?,
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            kernel: ArrayD::<f32>::zeros(vec![1, 1, 4, 1]),
-            data: ArrayD::<f32>::zeros(vec![1, 1, 4, 2]),
-            bias: Some(arr1(&[1.0]).into_dyn()),
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(2, 1),
         },
     );
 
@@ -762,7 +624,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: Some(arr1(&[0f32, 0., 1.]).into_dyn()),
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -777,7 +638,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -792,7 +652,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -807,7 +666,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -822,7 +680,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: Some(ArrayD::<f32>::ones(vec![1])),
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1, 1),
-            dilations: tvec!(1, 1, 1),
         },
     );
 
@@ -837,7 +694,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1, 1),
-            dilations: tvec!(1, 1, 1),
         },
     );
 
@@ -852,7 +708,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -867,7 +722,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -882,7 +736,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -897,7 +750,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -912,7 +764,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -927,7 +778,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -942,22 +792,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
-        },
-    );
-
-    suite.add(
-        "same_2d_4",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [1, 2])?,
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr4(&[[[[0.0, 0.0]]]]).into_dyn(),
-            kernel: arr4(&[[[[0.0, 0.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::SameUpper,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -972,7 +806,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(2),
-            dilations: tvec!(1),
         },
     );
 
@@ -987,7 +820,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(2),
-            dilations: tvec!(1),
         },
     );
 
@@ -1002,7 +834,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(1), tvec!(1)),
             strides: tvec!(2),
-            dilations: tvec!(1),
         },
     );
 
@@ -1017,7 +848,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(1), tvec!(1)),
             strides: tvec!(2),
-            dilations: tvec!(1),
         },
     );
 
@@ -1032,7 +862,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(0), tvec!(1)),
             strides: tvec!(2),
-            dilations: tvec!(1),
         },
     );
 
@@ -1047,7 +876,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(0), tvec!(0)),
             strides: tvec!(2),
-            dilations: tvec!(1),
         },
     );
 
@@ -1062,7 +890,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(3),
-            dilations: tvec!(1),
         },
     );
 
@@ -1077,7 +904,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 2),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1092,7 +918,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 2),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1107,22 +932,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 2),
-            dilations: tvec!(1, 1),
-        },
-    );
-
-    suite.add(
-        "strides_2d_same_3",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [1, 1])?,
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr4(&[[[[0.0]]]]).into_dyn(),
-            kernel: arr4(&[[[[0.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1137,7 +946,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(2, 2),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1152,7 +960,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(1), tvec!(0)),
             strides: tvec!(2),
-            dilations: tvec!(1),
         },
     );
 
@@ -1167,7 +974,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(0), tvec!(0)),
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -1182,7 +988,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(0, 1), tvec!(0, 0)),
             strides: tvec!(1, 2),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1197,7 +1002,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -1215,7 +1019,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(2, 2, 2),
-            dilations: tvec!(1, 1, 1),
         },
     );
 
@@ -1233,7 +1036,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(2, 3, 2),
-            dilations: tvec!(1, 1, 1),
         },
     );
 
@@ -1253,7 +1055,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1270,7 +1071,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1),
-            dilations: tvec!(1,),
         },
     );
     suite.add(
@@ -1284,7 +1084,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(2), tvec!(0)),
             strides: tvec!(1),
-            dilations: tvec!(1,),
         },
     );
 
@@ -1299,7 +1098,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(0), tvec!(2)),
             strides: tvec!(1),
-            dilations: tvec!(1,),
         },
     );
 
@@ -1314,7 +1112,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Explicit(tvec!(0), tvec!(1)),
             strides: tvec!(1),
-            dilations: tvec!(1,),
         },
     );
 
@@ -1329,7 +1126,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1344,7 +1140,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1,),
         },
     );
 
@@ -1363,7 +1158,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1,),
         },
     );
 
@@ -1383,7 +1177,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::SameUpper,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1398,7 +1191,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
         },
     );
 
@@ -1413,7 +1205,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1432,7 +1223,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1, 1),
-            dilations: tvec!(1, 1),
         },
     );
 
@@ -1447,142 +1237,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
-        },
-    );
-
-    suite.add(
-        "dil_0",
-        ConvProblem {
-            shape_in: DataFormat::CHW.from_n_c_hw(1, 1, [1]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr2(&[[1.]]).into_dyn(),
-            kernel: arr3(&[[[1.]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1),
-            dilations: tvec!(2),
-        },
-    );
-
-    suite.add(
-        "dil_1",
-        ConvProblem {
-            shape_in: DataFormat::CHW.from_n_c_hw(1, 1, [2, 3]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr3(&[[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]).into_dyn(),
-            kernel: arr4(&[[[[0.0, 0.0, 0.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 2),
-        },
-    );
-
-    suite.add(
-        "dil_2",
-        ConvProblem {
-            shape_in: DataFormat::HWC.from_n_c_hw(1, 1, [2]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr2(&[[0.0], [0.0]]).into_dyn(),
-            kernel: arr3(&[[[0.0, 0.0]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1),
-            dilations: tvec!(2),
-        },
-    );
-
-    suite.add(
-        "dil_3",
-        ConvProblem {
-            shape_in: DataFormat::CHW.from_n_c_hw(1, 2, [1, 4]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr3(&[[[0.0, 0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0, -1.0]]]).into_dyn(),
-            kernel: arr4(&[[[[0.0, 0.0, 0.0, 0.0]], [[0.0, 0.0, 1.0, 0.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::SameUpper,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 3),
-        },
-    );
-
-    suite.add(
-        "dil_4",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [2]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr3(&[[[0.0, 0.0]]]).into_dyn(),
-            kernel: arr3(&[[[0.0, 0.0]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1),
-            dilations: tvec!(2),
-        },
-    );
-
-    suite.add(
-        "dil_5",
-        ConvProblem {
-            shape_in: DataFormat::CHW.from_n_c_hw(1, 1, [2]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr2(&[[0.0, 0.0]]).into_dyn(),
-            kernel: arr3(&[[[0.0, 0.0]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1),
-            dilations: tvec!(2),
-        },
-    );
-
-    suite.add(
-        "dil_6",
-        ConvProblem {
-            shape_in: DataFormat::CHW.from_n_c_hw(1, 1, [1, 2]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr3(&[[[8.0, 3.0]]]).into_dyn(),
-            kernel: arr4(&[[[[1.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(1, 2),
-        },
-    );
-
-    suite.add(
-        "dil_7",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [1, 1]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr4(&[[[[0f32]]]]).into_dyn(),
-            kernel: arr4(&[[[[0.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(1, 1),
-            dilations: tvec!(2, 2),
-        },
-    );
-
-    suite.add(
-        "dil_and_stride_2d",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [1, 1]).unwrap(),
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            data: arr4(&[[[[0f32]]]]).into_dyn(),
-            kernel: arr4(&[[[[1.0]]]]).into_dyn(),
-            bias: None,
-            pad: PaddingSpec::Valid,
-            strides: tvec!(3, 3),
-            dilations: tvec!(2, 2),
         },
     );
 
@@ -1597,22 +1251,6 @@ pub fn suite() -> TractResult<TestSuite> {
             bias: None,
             pad: PaddingSpec::Valid,
             strides: tvec!(1),
-            dilations: tvec!(1),
-        },
-    );
-
-    suite.add(
-        "bug_cuda_0",
-        ConvProblem {
-            shape_in: DataFormat::NCHW.from_n_c_hw(1, 1, [3, 2])?,
-            kernel_format: KernelFormat::OIHW,
-            group: 1,
-            kernel: ArrayD::<f32>::zeros(vec![1, 1, 3, 1]),
-            data: ArrayD::<f32>::zeros(vec![1, 1, 3, 2]),
-            bias: Some(arr1(&[1.0]).into_dyn()),
-            pad: PaddingSpec::Valid,
-            strides: tvec!(3, 1),
-            dilations: tvec!(3, 1),
         },
     );
 

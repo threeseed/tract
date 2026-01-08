@@ -2,7 +2,7 @@ use crate::internal::*;
 use crate::ops::einsum::block_quant_aware_input_shape;
 use crate::ops::matmul::pack::OptSimpleMatMulPack;
 use ndarray::*;
-use tract_linalg::block_quant::BlockQuantFact;
+use tract_linalg::block_quant::BlockQuantValue;
 use tract_linalg::mmm::MMMInputValue;
 
 #[derive(Debug, Clone, Hash, PartialEq)]
@@ -92,18 +92,17 @@ impl Gather {
         Ok(output)
     }
 
-    fn eval_bq<F: Datum>(&self, data: &BlobWithFact, indices: &TValue) -> TractResult<Tensor> {
-        let bqf = data.fact.downcast_ref::<BlockQuantFact>().context("Expected BlockQuantFact")?;
+    fn eval_bq<F: Datum>(&self, data: &BlockQuantValue, indices: &TValue) -> TractResult<Tensor> {
         ensure!(self.axis == 0);
-        ensure!(bqf.shape().len() == 2);
-        let data_shape = &bqf.shape();
+        ensure!(data.fact.shape().len() == 2);
+        let data_shape = &data.fact.shape();
         let output_shape = &*self.compute_output_shape(data_shape, indices.shape())?;
         let mut output = unsafe { Tensor::uninitialized::<F>(output_shape)? };
         let indices_slice = indices.as_slice::<i64>()?;
         let vector_len = data_shape[1];
 
-        let block_len = bqf.format.block_len();
-        let block_bytes = bqf.format.block_bytes();
+        let block_len = data.fact.format.block_len();
+        let block_bytes = data.fact.format.block_bytes();
         if F::datum_type() == f16::datum_type() {
             let output_slice = output.as_slice_mut::<f16>()?;
             for (pos, ix) in indices_slice.iter().enumerate() {
@@ -111,7 +110,7 @@ impl Gather {
                 for i in (0..vector_len).step_by(block_len) {
                     let offset = data_shape[1] * *ix as usize + i;
                     let block_id = offset / block_len;
-                    bqf.format.dequant_block_f16(
+                    data.fact.format.dequant_block_f16(
                         &data.value[block_id * block_bytes..][..block_bytes],
                         &mut slice[i..i + block_len],
                     );
@@ -124,7 +123,7 @@ impl Gather {
                 for i in (0..vector_len).step_by(block_len) {
                     let offset = data_shape[1] * *ix as usize + i;
                     let block_id = offset / block_len;
-                    bqf.format.dequant_block_f32(
+                    data.fact.format.dequant_block_f32(
                         &data.value[block_id * block_bytes..][..block_bytes],
                         &mut slice[i..i + block_len],
                     );
@@ -182,17 +181,14 @@ impl TypedOp for Gather {
         ensure!(inputs[1].datum_type == i64::datum_type());
         if inputs[0].datum_type.is_opaque() {
             let data_shape = block_quant_aware_input_shape(inputs[0])?;
-            Ok(tvec!(
-                self.output_type
-                    .unwrap()
-                    .fact(&*self.compute_output_shape(&data_shape, &inputs[1].shape)?)
-            ))
+            Ok(tvec!(self
+                .output_type
+                .unwrap()
+                .fact(&*self.compute_output_shape(&data_shape, &inputs[1].shape)?)))
         } else {
-            Ok(tvec!(
-                inputs[0]
-                    .datum_type
-                    .fact(&*self.compute_output_shape(&inputs[0].shape, &inputs[1].shape)?)
-            ))
+            Ok(tvec!(inputs[0]
+                .datum_type
+                .fact(&*self.compute_output_shape(&inputs[0].shape, &inputs[1].shape)?)))
         }
     }
 
@@ -254,7 +250,7 @@ impl EvalOp for Gather {
         let (data, indices) = args_2!(inputs);
         let result = if let Ok(opaque) = data.to_scalar::<Opaque>() {
             let dt = self.output_type.unwrap();
-            if let Some(data) = opaque.downcast_ref::<BlobWithFact>() {
+            if let Some(data) = opaque.downcast_ref::<BlockQuantValue>() {
                 dispatch_floatlike!(Self::eval_bq(dt)(self, data, &indices))?
             } else if let Some(data) = opaque.downcast_ref::<Box<dyn MMMInputValue>>() {
                 dispatch_floatlike!(Self::eval_input_store(dt)(self, &**data, &indices))?

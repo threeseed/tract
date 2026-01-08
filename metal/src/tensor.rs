@@ -13,6 +13,16 @@ pub enum MValue {
 }
 
 impl MValue {
+    #[inline]
+    pub fn view(&self) -> TensorView<'_> {
+        match self {
+            Self::Natural(t) => t.view(),
+            Self::Reshaped { t, shape, strides } => unsafe {
+                TensorView::from_bytes(t, 0, shape.as_slice(), strides.as_slice())
+            },
+        }
+    }
+
     /// Get the datum type of the tensor.
     #[inline]
     pub fn datum_type(&self) -> DatumType {
@@ -113,7 +123,6 @@ impl From<Arc<Tensor>> for MValue {
 pub struct MetalTensor {
     pub inner: MValue,
     pub device_buffer: MetalBuffer,
-    pub opaque_fact: Option<Box<dyn OpaqueFact>>,
 }
 
 impl std::fmt::Debug for MetalTensor {
@@ -167,7 +176,6 @@ impl OwnedDeviceTensor for MetalTensor {
         Ok(DeviceTensor::Owned(Box::new(Self {
             inner: self.inner.reshaped(shape)?,
             device_buffer: self.device_buffer.clone(),
-            opaque_fact: self.opaque_fact.clone(),
         })))
     }
 
@@ -177,8 +185,11 @@ impl OwnedDeviceTensor for MetalTensor {
         Ok(DeviceTensor::Owned(Box::new(Self {
             inner: self.inner.restrided(strides)?,
             device_buffer: self.device_buffer.clone(),
-            opaque_fact: self.opaque_fact.clone(),
         })))
+    }
+
+    fn as_arc_tensor(&self) -> Option<&Arc<Tensor>> {
+        self.inner.as_arc_tensor()
     }
 
     fn to_host(&self) -> TractResult<Arc<Tensor>> {
@@ -189,12 +200,9 @@ impl OwnedDeviceTensor for MetalTensor {
             .unwrap_or_else(|| self.inner.clone().into_tensor().into_arc_tensor()))
     }
 
-    fn opaque_fact(&self) -> Option<&dyn OpaqueFact> {
-        self.opaque_fact.as_deref()
-    }
-
-    fn get_bytes_slice(&self, offset: usize, len: usize) -> Vec<u8> {
-        self.inner.as_arc_tensor().unwrap().as_bytes()[offset..offset + len].to_vec()
+    #[inline]
+    fn view(&self) -> TensorView<'_> {
+        self.inner.view()
     }
 }
 

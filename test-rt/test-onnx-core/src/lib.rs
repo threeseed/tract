@@ -30,3 +30,4 @@ mod unoptimized {
 
     include!(concat!(env!("OUT_DIR"), "/tests/unoptimized.rs"));
 }
+

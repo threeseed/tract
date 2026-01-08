@@ -1,12 +1,5 @@
-use std::vec;
-
 use infra::Test;
 use suite_unit::bin_einsum::{BinEinsumProblem, BinEinsumProblemParams};
-use suite_unit::conv_f32::{ConvProblem, ConvProblemParams};
-use suite_unit::sdpa::{SdpaProblem, SdpaProblemParams};
-use tract_core::num_traits::Float;
-use tract_core::prelude::Datum;
-use tract_core::tract_data::half;
 
 pub fn suite() -> &'static infra::TestSuite {
     lazy_static::lazy_static! {
@@ -31,32 +24,11 @@ fn mk_suite() -> infra::TestSuite {
             ..BinEinsumProblemParams::default()
         },
     );
-
-    unit.get_sub_mut("conv_f32").add_arbitrary::<ConvProblem>(
-        "proptest",
-        ConvProblemParams { no_group: true, ..ConvProblemParams::default() },
-    );
-
-    unit.get_sub_mut("sdpa").add_arbitrary::<SdpaProblem<half::f16>>(
-        "proptest_f16",
-        SdpaProblemParams { embed_dims: vec![64, 128] },
-    );
     infra::TestSuite::default().with("onnx", onnx).with("unit", unit)
 }
 
-fn ignore_unit(t: &[String], case: &dyn Test) -> bool {
-    if let Some(sdpab) = case.downcast_ref::<SdpaProblem<f32>>() {
-        return !compatible_sdpa::<f32>(sdpab);
-    }
-
-    if let Some(sdpab) = case.downcast_ref::<SdpaProblem<half::f16>>() {
-        return !compatible_sdpa::<half::f16>(sdpab);
-    }
-    t[0] == "sdpa" && t[1] == "proptest_f32"
-}
-
-fn compatible_sdpa<F: Datum + Float>(sdpap: &SdpaProblem<F>) -> bool {
-    matches!(sdpap.k.shape().last().unwrap(), 64 | 80 | 96 | 112 | 128 | 256)
+fn ignore_unit(_t: &[String], _case: &dyn Test) -> bool {
+    false
 }
 
 fn ignore_onnx(t: &[String]) -> bool {
@@ -67,7 +39,7 @@ fn ignore_onnx(t: &[String]) -> bool {
     test_tril_zero
     test_triu_zero
     "#
-    .trim()
-    .lines()
-    .any(|s| t.last().unwrap() == s.trim())
+        .trim()
+        .lines()
+        .any(|s| t.last().unwrap() == s.trim())
 }

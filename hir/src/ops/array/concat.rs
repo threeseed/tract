@@ -10,6 +10,8 @@ pub struct Concat {
     axis: i64,
 }
 
+
+
 impl Concat {
     fn resolve_axis(&self, rank: i64) -> TractResult<usize> {
         if 0 <= self.axis && self.axis < rank {

@@ -147,6 +147,15 @@ impl DeviceTensor {
         }
     }
 
+    /// Get underlying inner tensor view.
+    #[inline]
+    pub fn view(&self) -> TensorView<'_> {
+        match self {
+            Self::Owned(t) => t.view(),
+            Self::ArenaView(t) => t.view(),
+        }
+    }
+
     /// Returns short description of the inner tensor.
     pub fn description(&self) -> String {
         format!("|{},{:?}|", self.shape().iter().join(","), self.datum_type(),)
@@ -179,7 +188,7 @@ impl DeviceTensor {
 
         Ok(match self {
             Self::Owned(o) => o.to_host()?,
-            Self::ArenaView(v) => v.to_host()?.into(),
+            Self::ArenaView(v) => v.clone().into_tensor().into(),
         })
     }
 }
@@ -189,8 +198,11 @@ impl Display for DeviceTensor {
         match self {
             Self::Owned(o) => o.fmt(f),
             Self::ArenaView(v) => {
-                let content =
-                    v.to_host().unwrap().dump(false).unwrap_or_else(|e| format!("Error : {e:?}"));
+                let content = v
+                    .clone()
+                    .into_tensor()
+                    .dump(false)
+                    .unwrap_or_else(|e| format!("Error : {e:?}"));
                 write!(f, "ArenaView: {{ {content} }}")
             }
         }

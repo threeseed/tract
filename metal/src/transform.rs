@@ -3,9 +3,7 @@ use crate::kernels::matmul::{GemmKernel, GgmlGemm, MetalGemmImplKind, MfaGemm, M
 use crate::{kernels, ops};
 use tract_core::tract_linalg::block_quant::Q4_0;
 use tract_gpu::fact::DeviceTypedFactExt;
-use tract_gpu::rewrite_rules::rewire_sdpa::rewire_sdpa;
 use tract_gpu::rewrite_rules::rewire_syncs::rewire_syncs;
-use tract_gpu::rewrite_rules::rms_norm::remove_rms_norm_cast;
 use tract_gpu::sync::{DeviceSync, DeviceSyncKind};
 use tract_transformers::ops::dyn_kv_cache::DynKeyValueCache;
 
@@ -91,8 +89,7 @@ impl MetalTransform {
         // Init Metal Context if not done previously
         metal_context();
 
-        rewire_sdpa(model)?;
-        rewrite_einsum_to_prefix_matmul(model, false)?;
+        rewrite_einsum_to_prefix_matmul(model)?;
         if stop_at_phase == 0 {
             return Ok(());
         }
@@ -100,11 +97,8 @@ impl MetalTransform {
         Rewriter::<MetalTransform>::default()
             .with_rule_for("untranspose-matmul-output", rewrite_rules::untranspose_matmul_output)
             .with_rule_for("add-broadcast-pre-matmul", rewrite_rules::add_broadcast_pre_matmul)
+            .with_rule_for("remove_rms_norm_cast", rewrite_rules::remove_rms_norm_cast)
             .rewrite(self, model)?;
-
-        Rewriter::default()
-            .with_rule_for("remove_rms_norm_cast", remove_rms_norm_cast)
-            .rewrite(&(), model)?;
 
         if stop_at_phase == 1 {
             return Ok(());
@@ -400,7 +394,6 @@ pub fn resolve_gemm_impl(
         Ok(gemm)
     } else if as_quant_fact(input_facts[0], &Q4_0).is_some()
         || as_quant_fact(input_facts[1], &Q4_0).is_some()
-        || input_facts[0].datum_type != input_facts[1].datum_type
         || is_input_broadcast(input_facts)
     {
         Ok(MetalGemmImplKind::Ggml)
@@ -419,27 +412,7 @@ fn convert_matmul_to_metal(
 ) -> TractResult<TVec<OutletId>> {
     let mut input_facts = model.node_input_facts(node.id)?;
 
-    let resolved_gemm_impl = resolve_gemm_impl(gemm_impl, input_facts.clone())?;
-    if matches!(resolved_gemm_impl, MetalGemmImplKind::Mlx | MetalGemmImplKind::Mfa)
-        && (input_facts[0].datum_type != input_facts[1].datum_type)
-    {
-        ensure!(
-            input_facts[0].datum_type == DatumType::F16
-                || input_facts[1].datum_type == DatumType::F16
-        );
-        let inp_to_cast = if input_facts[0].datum_type == DatumType::F16 {
-            &mut inputs[0]
-        } else {
-            &mut inputs[1]
-        };
-        *inp_to_cast = target.wire_node(
-            node.name.clone() + ".cast_input",
-            ops::MetalCast::new(DatumType::F32).unwrap(),
-            &[*inp_to_cast],
-        )?[0];
-    }
-
-    let mut matmul_output = match resolved_gemm_impl {
+    let mut matmul_output = match resolve_gemm_impl(gemm_impl, input_facts.clone())? {
         MetalGemmImplKind::Mlx => {
             let op = ops::MetalGemm::<MlxGemm>::new(op.transpose_a, op.transpose_b);
             target.wire_node(node.name.clone(), op, inputs)?

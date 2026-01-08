@@ -9,16 +9,15 @@ use num_traits::{Float, One};
 use std::fmt;
 use tract_core::internal::*;
 use tract_gpu::tensor::DeviceTensor;
-use tract_gpu::utils::{as_quant_fact, get_quant_fact};
+use tract_gpu::utils::as_quant_fact;
 
 use crate::Q40_ROW_PADDING;
 use crate::context::{TractCudaStream, cuda_context};
-use crate::kernels::launch_args::TractLaunchArgs;
 use crate::kernels::matmul::quant_act_q81::{QUANTIZE_BLOCK_SIZE, QUANTIZE_BLOCK_SIZE_MMQ};
 use crate::kernels::{
     LibraryName, get_cuda_view, get_cuda_view_mut, get_sliced_cuda_view, get_sliced_cuda_view_mut,
 };
-use crate::utils::get_ggml_q81_fact;
+use crate::utils::{get_ggml_q81_fact, get_quant_fact};
 
 use DatumType::{F16, F32};
 
@@ -214,19 +213,19 @@ fn dispatch_ggml_matvec(
 
     let kernel_name = kernel_name_mat_vec(params.dts[0], params.m, block_size)?;
     let mut func = cuda_context().load_pipeline(LibraryName::Ggml, kernel_name)?;
-    let mut launch_args = TractLaunchArgs::new(stream, &func);
-    launch_args.push_view(&w_view);
-    launch_args.push_view(&act_view);
-    launch_args.push_view(&output_view);
-    launch_args.push_i32(k_div_2);
-    launch_args.push_i32(params.act_batch);
-    launch_args.push_i32(params.w_strides[1]);
-    launch_args.push_i32(ncols_act_div_2);
-    launch_args.push_i32(params.out_strides[1]);
-    launch_args.push_i32(batch_ratio);
-    launch_args.push_i32(params.w_strides[0]);
-    launch_args.push_i32(params.act_strides[0]);
-    launch_args.push_i32(params.out_strides[0]);
+    let mut launch_args = stream.launch_builder(&func);
+    launch_args.arg(&w_view);
+    launch_args.arg(&act_view);
+    launch_args.arg(&output_view);
+    launch_args.arg(&k_div_2);
+    launch_args.arg(&params.act_batch);
+    launch_args.arg(&params.w_strides[1]);
+    launch_args.arg(&ncols_act_div_2);
+    launch_args.arg(&params.out_strides[1]);
+    launch_args.arg(&batch_ratio);
+    launch_args.arg(&params.w_strides[0]);
+    launch_args.arg(&params.act_strides[0]);
+    launch_args.arg(&params.out_strides[0]);
 
     let cfg = LaunchConfig {
         grid_dim: (params.n as _, params.act_batch as _, 1),
@@ -349,22 +348,22 @@ fn launch_matmul_q40(
         CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         nbytes_shared as i32,
     )?;
-    let mut launch_args = TractLaunchArgs::new(stream, &func);
-    launch_args.push_view(weights);
-    launch_args.push_view(quant_activ);
-    launch_args.push_view(output);
-    launch_args.push_view(fixup_tens);
-    launch_args.push_i32(params.k);
-    launch_args.push_i32(params.n);
-    launch_args.push_i32(params.m);
-    launch_args.push_i32(n_blocks);
-    launch_args.push_i32(params.m);
-    launch_args.push_i32(params.n);
-    launch_args.push_i32(batch_ratio);
-    launch_args.push_i32(params.act_batch);
-    launch_args.push_i32(w_batch_stride);
-    launch_args.push_i32(act_batch_stride);
-    launch_args.push_i32(params.out_strides[0]);
+    let mut launch_args = stream.launch_builder(&func);
+    launch_args.arg(weights);
+    launch_args.arg(quant_activ);
+    launch_args.arg(output);
+    launch_args.arg(fixup_tens);
+    launch_args.arg(&params.k);
+    launch_args.arg(&params.n);
+    launch_args.arg(&params.m);
+    launch_args.arg(&n_blocks);
+    launch_args.arg(&params.m);
+    launch_args.arg(&params.n);
+    launch_args.arg(&batch_ratio);
+    launch_args.arg(&params.act_batch);
+    launch_args.arg(&w_batch_stride);
+    launch_args.arg(&act_batch_stride);
+    launch_args.arg(&params.out_strides[0]);
 
     let cfg = LaunchConfig {
         grid_dim: (props.multiProcessorCount as usize as _, 1, 1),
@@ -390,15 +389,15 @@ fn launch_fixup_q40(
     let context = cuda_context();
     let props = context.properties();
     let func = context.load_pipeline(LibraryName::GgmlQ, kernel_name)?;
-    let mut launch_args = TractLaunchArgs::new(stream, &func);
-    launch_args.push_view(output);
-    launch_args.push_view(fixup_tens);
-    launch_args.push_i32(params.k);
-    launch_args.push_i32(params.n);
-    launch_args.push_i32(params.m);
-    launch_args.push_i32(params.n);
-    launch_args.push_i32(params.act_batch);
-    launch_args.push_i32(params.out_strides[0]);
+    let mut launch_args = stream.launch_builder(&func);
+    launch_args.arg(output);
+    launch_args.arg(fixup_tens);
+    launch_args.arg(&params.k);
+    launch_args.arg(&params.n);
+    launch_args.arg(&params.m);
+    launch_args.arg(&params.n);
+    launch_args.arg(&params.act_batch);
+    launch_args.arg(&params.out_strides[0]);
 
     let cfg = LaunchConfig {
         grid_dim: (props.multiProcessorCount as usize as _, 1, 1),
@@ -424,7 +423,7 @@ fn dispatch_ggml_matmul_q40(
     let context = cuda_context();
     let props = context.properties();
 
-    let null_ptr = stream.null()?;
+    let null_ptr = stream.null::<u8>()?;
 
     let padded_k = params.k.next_multiple_of(Q40_ROW_PADDING);
     let n_blocks = padded_k / Q4_0.block_len(); // padded Q40 weights
@@ -484,6 +483,7 @@ fn dispatch_ggml_matvec_q40(
     ensure!(params.act_batch % params.w_batch == 0);
 
     let context = cuda_context();
+    let props = context.properties();
     let null_ptr = stream.null::<u8>()?;
 
     let padded_k = params.k.next_multiple_of(Q40_ROW_PADDING);
@@ -498,19 +498,19 @@ fn dispatch_ggml_matvec_q40(
     let batch_ratio = params.act_batch / params.w_batch;
 
     let func = context.load_pipeline(LibraryName::GgmlQ, format!("mul_vec_q40_m_{}", params.m))?;
-    let mut launch_args = TractLaunchArgs::new(stream, &func);
-    launch_args.push_view(weights);
-    launch_args.push_view(activs);
-    launch_args.push_view(output);
-    launch_args.push_i32(params.k);
-    launch_args.push_i32(params.act_batch);
-    launch_args.push_i32(n_blocks);
-    launch_args.push_i32(stride_col_act);
-    launch_args.push_i32(stride_col_out);
-    launch_args.push_i32(batch_ratio);
-    launch_args.push_i32(stride_channel_w);
-    launch_args.push_i32(stride_channel_act);
-    launch_args.push_i32(stride_channel_out);
+    let mut launch_args = stream.launch_builder(&func);
+    launch_args.arg(weights);
+    launch_args.arg(activs);
+    launch_args.arg(output);
+    launch_args.arg(&params.k);
+    launch_args.arg(&params.act_batch);
+    launch_args.arg(&n_blocks);
+    launch_args.arg(&stride_col_act);
+    launch_args.arg(&stride_col_out);
+    launch_args.arg(&batch_ratio);
+    launch_args.arg(&stride_channel_w);
+    launch_args.arg(&stride_channel_act);
+    launch_args.arg(&stride_channel_out);
 
     let rows_per_block = if params.m == 1 { 1 } else { 2 };
     let n_warps = if params.m <= 4 { 4 } else { 2 };
@@ -520,10 +520,24 @@ fn dispatch_ggml_matvec_q40(
         shared_mem_bytes: 0,
     };
 
-    launch_args.launch(cfg)
+    unsafe { launch_args.launch(cfg) };
+    Ok(())
 }
 
 impl GgmlGemm {
+    pub fn is_supported_dts(&self, facts: &[TypedFact]) -> bool {
+        assert!(facts.len() == 2, "Ggml: Expected 2 inputs for Matmul");
+
+        let regular_types_support = matches!(
+            (facts[0].datum_type, facts[1].datum_type),
+            (F32, F32) | (F16, F16) | (F16, F32)
+        );
+
+        regular_types_support
+            || (as_quant_fact(&facts[1], &Q4_0).is_some()
+                && matches!(facts[0].datum_type, F16 | F32))
+    }
+
     fn output_dt(&self, activ_dt: DatumType, weight_dt: DatumType) -> TractResult<DatumType> {
         ensure!(weight_dt == activ_dt);
         if activ_dt == DatumType::Opaque {
@@ -634,7 +648,9 @@ mod tests {
     use proptest::prelude::*;
     use tract_core::ops::einsum::prefix_matmul::PrefixMatMul;
     use tract_core::tract_data::itertools::Itertools;
-    use tract_core::tract_linalg::block_quant::{BlockQuant, BlockQuantFact, Q4_0};
+    use tract_core::tract_linalg::block_quant::{
+        BlockQuant, BlockQuantFact, BlockQuantValue, Q4_0,
+    };
     use tract_gpu::tensor::IntoDevice;
 
     pub(crate) fn run_mmm_test_case(
@@ -690,7 +706,6 @@ mod tests {
                 transpose_b,
                 transpose_c: false,
                 quantize_output: None,
-                operating_dt: Some(act_dt),
             };
 
             // Compare to full precision
@@ -868,7 +883,6 @@ mod tests {
                 transpose_b: self.transpose_rhs,
                 transpose_c: false,
                 quantize_output: None,
-                operating_dt: Some(F::datum_type()),
             };
 
             let lhs_tensor = if self.transpose_lhs {
@@ -926,11 +940,11 @@ mod tests {
                                 .map(|x| x.to_f32().unwrap())
                                 .collect_vec(),
                         )?;
-                        let bqv = BlobWithFact {
-                            fact: Box::new(BlockQuantFact::new(
+                        let bqv = BlockQuantValue {
+                            fact: BlockQuantFact::new(
                                 Box::new(Q4_0),
                                 tvec![self.b, self.n, self.k],
-                            )),
+                            ),
                             value: Arc::new(w_quant),
                         };
                         let padded_q40 = pad_q40(&bqv)?;

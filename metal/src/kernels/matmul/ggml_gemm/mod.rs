@@ -142,7 +142,7 @@ impl GemmKernel for GgmlGemm {
 
         let regular_types_support = matches!(
             (facts[0].datum_type, facts[1].datum_type),
-            (F32, F32) | (F16, F16) | (F32, F16)
+            (F32, F32) | (F16, F16) | (F16, F32)
         );
 
         regular_types_support
@@ -330,7 +330,7 @@ mod tests {
     use tract_core::ops::array::MultiBroadcastTo;
     use tract_core::ops::cast::Cast;
     use tract_core::ops::einsum::prefix_matmul::PrefixMatMul;
-    use tract_linalg::block_quant::{BlockQuant, BlockQuantFact, Q4_0};
+    use tract_linalg::block_quant::{BlockQuant, BlockQuantFact, BlockQuantValue, Q4_0};
 
     use super::*;
     use crate::kernels::matmul::GemmImpl;
@@ -389,7 +389,6 @@ mod tests {
             transpose_b: true,
             transpose_c: false,
             quantize_output: None,
-            operating_dt: Some(DatumType::F32),
         };
 
         let mut model = TypedModel::default();
@@ -461,8 +460,8 @@ mod tests {
                     Q4_0.simulate_precision_loss(Tensor::from_shape(&b_shape, &b_data)?, 2)?;
 
                 ensure!(k % 32 == 0);
-                let b_q4_0_tensor = tensor0(Opaque(Arc::new(BlobWithFact {
-                    fact: Box::new(BlockQuantFact::new(Box::new(Q4_0), tvec![batch, n, k])),
+                let b_q4_0_tensor = tensor0(Opaque(Arc::new(BlockQuantValue {
+                    fact: BlockQuantFact::new(Box::new(Q4_0), tvec![batch, n, k]),
                     value: Arc::new(Q4_0.quant_f32(&b_data)?),
                 })));
                 (b_tensor, b_q4_0_tensor)

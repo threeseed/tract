@@ -13,3 +13,4 @@ impl PulsedOp for PulsedAxisSlice {
     as_op!();
     pulsed_op_to_typed_op!();
 }
+

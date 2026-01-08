@@ -1,4 +1,6 @@
-#include "common.cuh"
+#include <cstdint>
+#include <cuda_fp16.h>
+#include "quantize.cu"
 
 // Check CC Version
 #define CUDA_CC_TURING 750
@@ -19,6 +21,149 @@
 #define PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
 #define MMQ_MMA_TILE_X_K_Q8_0 (2 * WARP_SIZE + 2 * WARP_SIZE / QI8_0 + 4)
 
+namespace cuda_mma {
+
+template <int I_, int J_, typename T> struct tile {
+  static constexpr int I = I_;
+  static constexpr int J = J_;
+  static constexpr int ne = I * J / WARP_SIZE;
+  T x[ne] = {0};
+
+  static __device__ __forceinline__ int get_i(const int l) {
+    if constexpr (I == 8 && (J == 4 || J == 8)) {
+      return threadIdx.x / 4;
+    } else if constexpr (I == 16 && J == 8) {
+      return (l / 2) * 8 + threadIdx.x / 4;
+    } else if constexpr (I == 16 && J == 16) {
+      return ((l / 2) % 2) * 8 + threadIdx.x / 4;
+    } else {
+      static_assert(I == -1 && J == -1,
+                    "template specialization not implemented");
+    }
+  }
+
+  static __device__ __forceinline__ int get_j(const int l) {
+    if constexpr (I == 8 && J == 4) {
+      return threadIdx.x % 4;
+    } else if constexpr (I == 8 && J == 8) {
+      return 4 * l + threadIdx.x % 4;
+    } else if constexpr (I == 16 && J == 8) {
+      return 2 * (threadIdx.x % 4) + l % 2;
+    } else if constexpr (I == 16 && J == 16) {
+      return 8 * (l / 4) + 2 * (threadIdx.x % 4) + l % 2;
+    } else {
+      static_assert(I == -1 && J == -1,
+                    "template specialization not implemented");
+    }
+  }
+};
+
+template <int I_, int J_> struct tile<I_, J_, half2> {
+  static constexpr int I = I_;
+  static constexpr int J = J_;
+  static constexpr int ne = I * J / WARP_SIZE;
+  half2 x[ne] = {{0.0f, 0.0f}};
+
+  static __device__ __forceinline__ int get_i(const int l) {
+    if constexpr (I == 8 && J == 8) {
+      return threadIdx.x / 4;
+    } else if constexpr (I == 16 && J == 4) {
+      return l * 8 + threadIdx.x / 4;
+    } else if constexpr (I == 16 && J == 8) {
+      return (l % 2) * 8 + threadIdx.x / 4;
+    } else {
+      static_assert(I == -1 && J == -1,
+                    "template specialization not implemented");
+    }
+  }
+
+  static __device__ __forceinline__ int get_j(const int l) {
+    if constexpr (I == 8 && J == 8) {
+      return l * 4 + threadIdx.x % 4;
+    } else if constexpr (I == 16 && J == 4) {
+      return threadIdx.x % 4;
+    } else if constexpr (I == 16 && J == 8) {
+      return (l / 2) * 4 + threadIdx.x % 4;
+    } else {
+      static_assert(I == -1 && J == -1,
+                    "template specialization not implemented");
+    }
+  }
+};
+
+template <int I, int J>
+static __device__ __forceinline__ tile<I, J / 2, half2>
+get_half2(const tile<I, J, float> &tile_float) {
+  tile<I, J / 2, half2> ret;
+#pragma unroll
+  for (int l0 = 0; l0 < tile_float.ne; l0 += 2) {
+    ret.x[l0 / 2] = make_half2(tile_float.x[l0 + 0], tile_float.x[l0 + 1]);
+  }
+  return ret;
+}
+
+template <int I, int J, typename T>
+static __device__ __forceinline__ void
+load_generic(tile<I, J, T> &t, const T *__restrict__ xs0, const int stride) {
+#pragma unroll
+  for (int l = 0; l < t.ne; ++l) {
+    t.x[l] = xs0[t.get_i(l) * stride + t.get_j(l)];
+  }
+}
+
+template <typename T>
+static __device__ __forceinline__ void
+load_ldmatrix(tile<8, 8, T> &t, const T *__restrict__ xs0, const int stride) {
+  int *xi = (int *)t.x;
+  const int *xs = (const int *)xs0 + (threadIdx.x % t.I) * stride +
+                  ((threadIdx.x / t.I) * (t.J / 2)) % t.J;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+               : "=r"(xi[0]), "=r"(xi[1])
+               : "l"(xs));
+}
+
+template <typename T>
+static __device__ __forceinline__ void
+load_ldmatrix(tile<16, 4, T> &t, const T *__restrict__ xs0, const int stride) {
+  int *xi = (int *)t.x;
+  const int *xs = (const int *)xs0 + (threadIdx.x % t.I) * stride;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+               : "=r"(xi[0]), "=r"(xi[1])
+               : "l"(xs));
+}
+
+template <typename T>
+static __device__ __forceinline__ void
+load_ldmatrix(tile<16, 8, T> &t, const T *__restrict__ xs0, const int stride) {
+  int *xi = (int *)t.x;
+  const int *xs = (const int *)xs0 + (threadIdx.x % t.I) * stride +
+                  (threadIdx.x / t.I) * (t.J / 2);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+               : "l"(xs));
+}
+
+template <typename T>
+static __device__ __forceinline__ void
+load_ldmatrix_trans(tile<16, 8, T> &t, const T *__restrict__ xs0,
+                    const int stride) {
+  int *xi = (int *)t.x;
+  const int *xs = (const int *)xs0 + (threadIdx.x % t.I) * stride +
+                  (threadIdx.x / t.I) * (t.J / 2);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(xi[0]), "=r"(xi[2]), "=r"(xi[1]), "=r"(xi[3])
+               : "l"(xs));
+}
+
+static __device__ __forceinline__ void
+mma(tile<16, 8, int> &D, const tile<16, 8, int> &A, const tile<8, 8, int> &B) {
+  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, "
+      "%5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
+      : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]), "r"(B.x[0]),
+        "r"(B.x[1]));
+}
+} // namespace cuda_mma
 
 static __device__ __forceinline__ int get_int_b2(const void *x,
                                                  const int &i32) {
@@ -297,11 +442,11 @@ template <int mmq_x, int nwarps, bool need_check>
 static __device__ __forceinline__ void
 mul_mat_q(const char *__restrict__ x, const int *__restrict__ y,
           float *__restrict__ dst, float *__restrict__ tmp_fixup,
-          const int32_t ncols_x, const int32_t nrows_x, const int32_t ncols_dst,
-          const int32_t stride_row_x, const int32_t ncols_y, const int32_t stride_col_dst,
-          const int32_t channel_ratio, const int32_t nchannels_y,
-          const int32_t stride_channel_x, const int32_t stride_channel_y,
-          const int32_t stride_channel_dst) {
+          const int ncols_x, const int nrows_x, const int ncols_dst,
+          const int stride_row_x, const int ncols_y, const int stride_col_dst,
+          const int channel_ratio, const int nchannels_y,
+          const int stride_channel_x, const int stride_channel_y,
+          const int stride_channel_dst) {
   constexpr int qk = QK4_0;
 
   const int ntx = (ncols_dst + mmq_x - 1) / mmq_x; // Number of tiles x
@@ -411,9 +556,9 @@ template <int mmq_x, int nwarps, bool need_check>
 static __device__ __forceinline__ void
 mul_mat_q_stream_k_fixup(float *__restrict__ dst,
                          const float *__restrict__ tmp_last_tile,
-                         const int32_t ncols_x, const int32_t nrows_x,
-                         const int32_t ncols_dst, const int32_t stride_col_dst,
-                         const int32_t nchannels_y, const int32_t stride_channel_dst) {
+                         const int ncols_x, const int nrows_x,
+                         const int ncols_dst, const int stride_col_dst,
+                         const int nchannels_y, const int stride_channel_dst) {
   constexpr int qk = QK4_0;
   constexpr int blocks_per_iter = MMQ_ITER_K / qk;
   const int64_t blocks_per_ne00 = ncols_x / qk;
@@ -527,11 +672,11 @@ mul_mat_q_stream_k_fixup(float *__restrict__ dst,
       ##mmq_x##_##nwarps##_                                                    \
       ##need_check(const char *__restrict__ x, const int *__restrict__ y,      \
                    float *__restrict__ dst, float *__restrict__ tmp_fixup,     \
-                   const int32_t ncols_x, const int32_t nrows_x, const int32_t ncols_dst,  \
-                   const int32_t stride_row_x, const int32_t ncols_y,                  \
-                   const int32_t stride_col_dst, const int32_t channel_ratio,          \
-                   const int32_t nchannels_y, const int32_t stride_channel_x,          \
-                   const int32_t stride_channel_y, const int32_t stride_channel_dst) { \
+                   const int ncols_x, const int nrows_x, const int ncols_dst,  \
+                   const int stride_row_x, const int ncols_y,                  \
+                   const int stride_col_dst, const int channel_ratio,          \
+                   const int nchannels_y, const int stride_channel_x,          \
+                   const int stride_channel_y, const int stride_channel_dst) { \
     mul_mat_q<mmq_x, nwarps, need_check>(                                      \
         x, y, dst, tmp_fixup, ncols_x, nrows_x, ncols_dst, stride_row_x,       \
         ncols_y, stride_col_dst, channel_ratio, nchannels_y, stride_channel_x, \
@@ -541,9 +686,9 @@ mul_mat_q_stream_k_fixup(float *__restrict__ dst,
   __global__ void                                                              \
       mul_mat_q40_stream_k_fixup##_##mmq_x##_##nwarps##_##need_check(          \
           float *__restrict__ dst, const float *__restrict__ tmp_last_tile,    \
-          const int32_t ncols_x, const int32_t nrows_x, const int32_t ncols_dst,           \
-          const int32_t stride_col_dst, const int32_t nchannels_y,                     \
-          const int32_t stride_channel_dst) {                                      \
+          const int ncols_x, const int nrows_x, const int ncols_dst,           \
+          const int stride_col_dst, const int nchannels_y,                     \
+          const int stride_channel_dst) {                                      \
     mul_mat_q_stream_k_fixup<mmq_x, nwarps, need_check>(                       \
         dst, tmp_last_tile, ncols_x, nrows_x, ncols_dst, stride_col_dst,       \
         nchannels_y, stride_channel_dst);                                      \
@@ -721,11 +866,11 @@ mul_mat_vec_q(const void *__restrict__ vx, const void *__restrict__ vy,
   __launch_bounds__(calc_nwarps(ncols_dst) * WARP_SIZE, 1) __global__          \
       void mul_vec_q40_m_                                                      \
       ##ncols_dst(const void *__restrict__ vx, const void *__restrict__ vy,    \
-                  float *__restrict__ dst, const int32_t ncols_x,                  \
-                  const int32_t nchannels_y, const int32_t stride_row_x,               \
-                  const int32_t stride_col_y, const int32_t stride_col_dst,            \
-                  const int32_t channel_ratio, const int32_t stride_channel_x,         \
-                  const int32_t stride_channel_y, const int32_t stride_channel_dst) {  \
+                  float *__restrict__ dst, const int ncols_x,                  \
+                  const int nchannels_y, const int stride_row_x,               \
+                  const int stride_col_y, const int stride_col_dst,            \
+                  const int channel_ratio, const int stride_channel_x,         \
+                  const int stride_channel_y, const int stride_channel_dst) {  \
     mul_mat_vec_q<ncols_dst>(vx, vy, dst, ncols_x, nchannels_y, stride_row_x,  \
                              stride_col_y, stride_col_dst, channel_ratio,      \
                              stride_channel_x, stride_channel_y,               \

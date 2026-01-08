@@ -20,8 +20,7 @@ where
 {
     input: Tensor,
     axis: usize,
-    eps: f32,
-    _phantom: PhantomData<F>,
+    eps: F,
 }
 
 impl<F> std::fmt::Debug for RmsNormProblem<F>
@@ -55,8 +54,7 @@ where
                 (input, Just(axis), 0f32..=1e6).prop_map(|(input, axis, eps)| Self {
                     input: input.into(),
                     axis,
-                    eps: eps / 1e5,
-                    _phantom: PhantomData,
+                    eps: F::from(eps / 1e5).unwrap(),
                 })
             })
             .boxed()
@@ -83,17 +81,17 @@ where
     }
 
     fn reference(&self) -> ArrayD<F> {
-        let input = self.input.cast_to::<f32>().unwrap();
+        let input = self.input.cast_to::<F>().unwrap();
 
-        let a = input.to_array_view::<f32>().unwrap().to_owned();
+        let a = input.to_array_view::<F>().unwrap().to_owned();
         let mean_square = a.pow2().mean_axis(tract_ndarray::Axis(self.axis)).unwrap();
 
         let norm = mean_square
             .mapv(|ms| (ms + self.eps).sqrt())
             .insert_axis(tract_ndarray::Axis(self.axis));
-        let broadcasted_norm = norm.broadcast(a.raw_dim()).unwrap().to_owned();
+        let broadcasted_norm = norm.broadcast(a.raw_dim()).unwrap();
 
-        (a / broadcasted_norm).mapv(|x| F::from(x).unwrap())
+        a / broadcasted_norm
     }
 }
 
@@ -103,6 +101,7 @@ where
 {
     fn run_with_approx(
         &self,
+        _suite: &str,
         id: &str,
         runtime: &dyn Runtime,
         approx: Approximation,
@@ -125,15 +124,7 @@ pub fn suite() -> TractResult<TestSuite> {
     suite.add_arbitrary::<RmsNormProblem<f32>>("proptest_f32", ());
     suite.add_arbitrary::<RmsNormProblem<f16>>("proptest_f16", ());
 
-    suite.add(
-        "trivial_f32_0",
-        RmsNormProblem::<f32> {
-            input: tensor1(&[0f32]),
-            axis: 0,
-            eps: 0f32,
-            _phantom: PhantomData,
-        },
-    );
+    suite.add("trivial_f32_0", RmsNormProblem { input: tensor1(&[0f32]), axis: 0, eps: 0f32 });
 
     Ok(suite)
 }

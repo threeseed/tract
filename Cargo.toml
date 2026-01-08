@@ -138,10 +138,9 @@ clap = { version = "~3.1", features = [ "cargo" ] }
 colorous = "1.0.5"
 core_affinity = "0.8.0"
 criterion = "0.6"
-cudarc = { version = "0.17", features = ["dynamic-loading", "cuda-12060", "f16", "cudnn"] }
+cudarc = { version = "0.16.4", features = ["dynamic-loading", "cuda-12060", "f16"] }
 derive-new = "0.5.9"
 dinghy-test = "0.6"
-dirs = "6.0.0"
 downcast-rs = "1.2.0"
 dyn-clone = "1.0.4"
 dyn-hash = "0.2"
@@ -152,9 +151,10 @@ float-ord = "0.3.2"
 foreign-types = "0.5"
 fs-err = "2"
 fs2 = "0.4.3"
+gdt-cpus = "25.12.0"
 getrandom = "0.2"
 half = { version=">=2.4,<3.0", features = [ "std", "num-traits" ] }
-home = "=0.5.11"
+home = "0.5.9"
 icu_collections = "1.5.1"
 icu_normalizer = "1.5.0"
 icu_normalizer_data = "1.5.1"
@@ -185,7 +185,9 @@ num-complex = "0.4.0"
 num-integer = "0.1.44"
 num-traits = "0.2.14"
 num_cpus = "1"
-openblas-src = { version = "0.10", features = ["static"] }
+openblas-src = { version = "0.10.13", features = ["static"] }
+par-core = { version = "2.0.0", features = [ "rayon" ] }
+par-iter = "2.0.0"
 pastey = "0.1"
 potential_utf = "0.1.0"
 proptest = "1.0.0"
@@ -193,6 +195,7 @@ prost = "0.11.0"
 prost-types = "0.11.0"
 py_literal = "0.4.0"
 rand = { version = "0.8.4", features = ["small_rng"] }
+rand_xoshiro = "0.6"
 rand_distr = "0.4"
 rayon = "1.10"
 readings-probe = "0.1.8"
@@ -205,8 +208,8 @@ safetensors = "0.6"
 scan_fmt = "0.2.6"
 serde = { version = "1.0.127", features = [ "derive" ] }
 serde_json = "1.0"
-simd-adler32 = { version = "0.3.7", features = ["std"] }
 smallvec = "1.6.1"
+snmalloc-rs = "0.3"
 string-interner = "0.15"
 structopt = { version = "0.3", default-features = false }
 tar = "0.4.37"
@@ -255,6 +258,7 @@ lto=false
 [profile.release]
 # debug = true
 lto = true
+opt-level = 3
 
 [profile.bench]
 debug = true

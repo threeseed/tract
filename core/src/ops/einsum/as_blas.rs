@@ -4,7 +4,7 @@ use crate::transform::ModelTransform;
 use crate::{broadcast, internal::*};
 use std::fmt::Debug;
 
-use super::prefix_matmul::{PrefixMatMul, rewrite_einsum_to_prefix_matmul};
+use super::prefix_matmul::{rewrite_einsum_to_prefix_matmul, PrefixMatMul};
 
 #[derive(Debug, Default)]
 pub struct AsBlas;
@@ -15,7 +15,7 @@ impl ModelTransform for AsBlas {
     }
 
     fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
-        rewrite_einsum_to_prefix_matmul(model, true)?;
+        rewrite_einsum_to_prefix_matmul(model)?;
         Rewriter::default()
             .with_rule_for("matmul-to-sgemm", matmul_to_sgemm)
             .rewrite(&(), model)?;

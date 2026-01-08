@@ -9,7 +9,7 @@ use tract_core::ops::nn::{expand_mean_of_squares, DataFormat, Softmax};
 use tract_core::tract_data::itertools::Itertools;
 
 pub fn rewrite_for_tflite(model: &mut TypedModel) -> TractResult<()> {
-    tract_core::ops::einsum::prefix_matmul::rewrite_einsum_to_prefix_matmul(model, true)?;
+    tract_core::ops::einsum::prefix_matmul::rewrite_einsum_to_prefix_matmul(model)?;
     Rewriter::default()
         .with_rule_for("trivial_axes_around_matmul", trivial_axes_around_matmul)
         .with_rule_for("kernel_in_ohwi", kernel_in_ohwi)

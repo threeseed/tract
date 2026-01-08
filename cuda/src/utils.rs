@@ -1,5 +1,4 @@
-use std::sync::OnceLock;
-
+use cudarc::driver::sys::Lib;
 use tract_core::internal::tract_smallvec::ToSmallVec;
 use tract_core::internal::*;
 use tract_core::tract_linalg::block_quant::*;
@@ -7,21 +6,80 @@ use tract_gpu::tensor::DeviceTensor;
 
 use crate::Q40_ROW_PADDING;
 use crate::ops::GgmlQuantQ81Fact;
+use crate::tensor::CudaTensor;
 
-static CULIBS_PRESENT: OnceLock<bool> = OnceLock::new();
+// Code copied from Cudarc for checking Cuda presence
+fn get_lib_name_candidates(lib_name: &str) -> Vec<String> {
+    use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 
-pub fn are_culibs_present() -> bool {
-    *CULIBS_PRESENT.get_or_init(|| unsafe {
-        cudarc::driver::sys::is_culib_present()
-            && cudarc::runtime::sys::is_culib_present()
-            && cudarc::nvrtc::sys::is_culib_present()
-            && cudarc::cublas::sys::is_culib_present()
-    })
+    let pointer_width = if cfg!(target_pointer_width = "32") {
+        "32"
+    } else if cfg!(target_pointer_width = "64") {
+        "64"
+    } else {
+        panic!("Unsupported target pointer width")
+    };
+
+    let major = "12";
+    let minor = "6";
+
+    [
+        std::format!("{DLL_PREFIX}{lib_name}{DLL_SUFFIX}"),
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}{DLL_SUFFIX}"),
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}_{major}{DLL_SUFFIX}"),
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}_{major}{minor}{DLL_SUFFIX}"),
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}_{major}{minor}_0{DLL_SUFFIX}"),
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}_{major}0_{minor}{DLL_SUFFIX}"),
+        // See issue #242
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}_10{DLL_SUFFIX}"),
+        // See issue #246
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}_{major}0_0{DLL_SUFFIX}"),
+        // See issue #260
+        std::format!("{DLL_PREFIX}{lib_name}{pointer_width}_9{DLL_SUFFIX}"),
+        // See issue #274
+        std::format!("{DLL_PREFIX}{lib_name}{DLL_SUFFIX}.{major}"),
+        std::format!("{DLL_PREFIX}{lib_name}{DLL_SUFFIX}.11"),
+        std::format!("{DLL_PREFIX}{lib_name}{DLL_SUFFIX}.10"),
+        // See issue #296
+        std::format!("{DLL_PREFIX}{lib_name}{DLL_SUFFIX}.1"),
+    ]
+    .into()
+}
+
+pub fn get_cuda_lib() -> Option<Lib> {
+    let lib_names = std::vec!["cuda", "nvcuda"];
+    let choices: std::vec::Vec<_> =
+        lib_names.iter().flat_map(|l| get_lib_name_candidates(l)).collect();
+    unsafe {
+        for choice in choices.iter() {
+            if let Ok(lib) = Lib::new(choice) {
+                return Some(lib);
+            }
+        }
+        None
+    }
+}
+
+pub fn get_quant_fact(t: &DeviceTensor, format: &dyn BlockQuant) -> Option<BlockQuantFact> {
+    if let DeviceTensor::Owned(t) = t {
+        t.downcast_ref::<CudaTensor>()
+            .expect("Non Cuda Tensor in Cuda context")
+            .opaque_fact()
+            .and_then(|of| of.downcast_ref::<BlockQuantFact>())
+            .cloned()
+            .filter(|bqf| bqf.format.same_as(format))
+    } else {
+        None
+    }
 }
 
 pub fn get_ggml_q81_fact(t: &DeviceTensor) -> Option<GgmlQuantQ81Fact> {
     if let DeviceTensor::Owned(t) = t {
-        t.opaque_fact().and_then(|of| of.downcast_ref::<GgmlQuantQ81Fact>()).cloned()
+        t.downcast_ref::<CudaTensor>()
+            .expect("Non Cuda Tensor in Cuda context")
+            .opaque_fact()
+            .and_then(|of| of.downcast_ref::<GgmlQuantQ81Fact>())
+            .cloned()
     } else if let DeviceTensor::ArenaView(t) = t {
         t.opaque_fact().and_then(|of| of.downcast_ref::<GgmlQuantQ81Fact>()).cloned()
     } else {
@@ -29,10 +87,8 @@ pub fn get_ggml_q81_fact(t: &DeviceTensor) -> Option<GgmlQuantQ81Fact> {
     }
 }
 
-pub fn pad_q40(q40_bqv: &BlobWithFact) -> TractResult<BlobWithFact> {
-    let q40_bqf =
-        q40_bqv.fact.downcast_ref::<BlockQuantFact>().context("Expected BlockQuantFact")?;
-    let shape = q40_bqf.shape();
+pub fn pad_q40(q40_bqv: &BlockQuantValue) -> TractResult<BlockQuantValue> {
+    let shape = q40_bqv.fact.shape();
     ensure!(shape.len() >= 2);
 
     let k = *shape.last().unwrap();
@@ -60,8 +116,8 @@ pub fn pad_q40(q40_bqv: &BlobWithFact) -> TractResult<BlobWithFact> {
     let mut new_shape = shape.to_smallvec();
     *new_shape.last_mut().unwrap() += to_pad;
 
-    Ok(BlobWithFact {
-        fact: Box::new(BlockQuantFact::new(q40_bqf.format.clone(), new_shape)),
+    Ok(BlockQuantValue {
+        fact: BlockQuantFact::new(q40_bqv.fact.format.clone(), new_shape),
         value: Arc::new(Blob::from_bytes(&new_data)?),
     })
 }

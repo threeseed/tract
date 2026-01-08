@@ -525,22 +525,30 @@ where
 
     pub fn linear_prec(&self, id: usize) -> TractResult<Option<&Node<F, O>>> {
         let node = &self.nodes()[id];
-        rule_if!(node.inputs.len() == 1);
+        if node.inputs.len() != 1 {
+            return Ok(None);
+        }
         let prec = &self.nodes()[node.inputs[0].node];
-        rule_if!(prec.outputs.iter().map(|of| of.successors.len()).sum::<usize>() == 1);
+        if prec.outputs.iter().map(|of| of.successors.len()).sum::<usize>() != 1 {
+            return Ok(None);
+        }
         Ok(Some(prec))
     }
 
     pub fn single_prec(&self, id: usize) -> TractResult<Option<&Node<F, O>>> {
         let node = &self.nodes()[id];
-        rule_if!(node.inputs.len() == 1);
+        if node.inputs.len() != 1 {
+            return Ok(None);
+        }
         let prec = &self.nodes()[node.inputs[0].node];
         Ok(Some(prec))
     }
 
     pub fn all_prec(&self, id: usize) -> TractResult<Option<TVec<&Node<F, O>>>> {
         let node = &self.nodes()[id];
-        rule_if!(node.inputs.len() > 0);
+        if node.inputs.is_empty() {
+            return Ok(None);
+        };
         Ok(Some(node.inputs.iter().map(|n| &self.nodes()[n.node]).collect()))
     }
 
@@ -573,26 +581,32 @@ where
     pub fn linear_succ(&self, id: usize) -> TractResult<Option<&Node<F, O>>> {
         let node = &self.nodes()[id];
 
-        rule_if!(node.outputs.len() == 1);
-        rule_if!(node.outputs[0].successors.len() == 1);
+        if node.outputs.len() != 1 || node.outputs[0].successors.len() != 1 {
+            return Ok(None);
+        }
         let succ = node.outputs[0].successors[0];
         let succ = &self.nodes()[succ.node];
-        rule_if!(succ.inputs.len() == 1);
+        if succ.inputs.len() != 1 {
+            return Ok(None);
+        }
         Ok(Some(succ))
     }
 
     pub fn single_succ(&self, id: usize) -> TractResult<Option<&Node<F, O>>> {
         let node = &self.nodes()[id];
 
-        rule_if!(node.outputs.len() == 1);
-        rule_if!(node.outputs[0].successors.len() == 1);
+        if node.outputs.len() != 1 || node.outputs[0].successors.len() != 1 {
+            return Ok(None);
+        }
         let succ = node.outputs[0].successors[0];
         Ok(Some(&self.nodes()[succ.node]))
     }
 
     pub fn all_succ(&self, id: usize) -> TractResult<Option<TVec<&Node<F, O>>>> {
         let node = &self.nodes()[id];
-        rule_if!(!node.outputs.is_empty());
+        if node.outputs.is_empty() {
+            return Ok(None);
+        };
 
         Ok(Some(
             node.outputs

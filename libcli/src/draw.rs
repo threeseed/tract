@@ -103,7 +103,6 @@ impl DrawingState {
                     .count()
                     + must_clone as usize;
                 // println!("{}->{} (offset: {})", little, big, offset);
-                #[allow(clippy::unnecessary_unwrap)]
                 if moving.color.is_some() && offset != 0 {
                     let color = moving.color.unwrap();
                     for w in &self.wires[0..little] {
@@ -180,7 +179,6 @@ impl DrawingState {
         if display {
             self.latest_node_color = if !inputs.is_empty() {
                 let wire0 = &self.wires[passthrough_count];
-                #[allow(clippy::unnecessary_unwrap)]
                 if wire0.color.is_some() && !wire0.should_change_color {
                     wire0.color.unwrap()
                 } else {

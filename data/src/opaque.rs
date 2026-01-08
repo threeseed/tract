@@ -1,5 +1,4 @@
 #![allow(clippy::derived_hash_with_manual_eq)]
-use crate::blob::Blob;
 use crate::datum::DatumType;
 use crate::dim::TDim;
 use crate::internal::{TVec, Tensor, TractResult};
@@ -8,7 +7,7 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use downcast_rs::{Downcast, impl_downcast};
+use downcast_rs::{impl_downcast, Downcast};
 use dyn_hash::DynHash;
 
 pub trait OpaquePayload: DynHash + Send + Sync + Debug + Display + Downcast {
@@ -64,7 +63,7 @@ impl OpaqueFact for TVec<Box<dyn OpaqueFact>> {
     fn same_as(&self, other: &dyn OpaqueFact) -> bool {
         other.downcast_ref::<Self>().is_some_and(|o| self == o)
     }
-
+    
     fn buffer_sizes(&self) -> TVec<TDim> {
         self.iter().flat_map(|it| it.buffer_sizes()).collect()
     }
@@ -73,7 +72,7 @@ impl OpaqueFact for TVec<Option<Box<dyn OpaqueFact>>> {
     fn same_as(&self, other: &dyn OpaqueFact) -> bool {
         other.downcast_ref::<Self>().is_some_and(|o| self == o)
     }
-
+    
     fn buffer_sizes(&self) -> TVec<TDim> {
         self.iter().flatten().flat_map(|it| it.buffer_sizes()).collect()
     }
@@ -129,31 +128,5 @@ impl Default for Opaque {
 impl PartialEq for Opaque {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0) && self.0.same_as(&*other.0)
-    }
-}
-
-#[derive(Clone, Hash)]
-pub struct BlobWithFact {
-    pub fact: Box<dyn OpaqueFact>,
-    pub value: Arc<Blob>,
-}
-
-impl OpaquePayload for BlobWithFact {
-    fn same_as(&self, other: &dyn OpaquePayload) -> bool {
-        other
-            .downcast_ref::<Self>()
-            .is_some_and(|o| o.fact == self.fact.clone() && o.value == self.value)
-    }
-}
-
-impl std::fmt::Debug for BlobWithFact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?} {:?}", self.fact, self.value)
-    }
-}
-
-impl std::fmt::Display for BlobWithFact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
     }
 }

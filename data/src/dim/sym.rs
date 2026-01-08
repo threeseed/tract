@@ -10,7 +10,7 @@ use string_interner::Symbol as _;
 use crate::TractResult;
 
 use super::parse::parse_assertion;
-use super::{Assertion, TDim, parse_tdim};
+use super::{parse_tdim, Assertion, TDim};
 
 #[derive(Clone, Default)]
 pub struct SymbolScope(pub Arc<ReentrantMutex<RefCell<SymbolScopeData>>>);

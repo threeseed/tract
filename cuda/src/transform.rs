@@ -1,38 +1,31 @@
-use DatumType::{F16, F32};
 use tract_core::dyn_clone::clone_box;
 use tract_core::internal::*;
 use tract_core::model::translator::Translate;
 use tract_core::ops::array::{MultiBroadcastTo, Slice, TypedConcat};
 use tract_core::ops::binary::TypedBinOp;
 use tract_core::ops::cast::Cast;
-use tract_core::ops::cnn::conv::rewrite_kernel_conv_in_oihw;
-use tract_core::ops::cnn::{Conv, rewrite_conv_with_n_axis};
 use tract_core::ops::einsum::prefix_matmul::{PrefixMatMul, rewrite_einsum_to_prefix_matmul};
 use tract_core::ops::element_wise::ElementWiseOp;
 use tract_core::ops::konst::Const;
 use tract_core::ops::logic::Comp;
-use tract_core::ops::nn::{LeakyRelu, Reduce, Softmax};
+use tract_core::ops::nn::{Reduce, Softmax};
 use tract_core::tract_data::itertools::Itertools;
 use tract_core::tract_linalg::block_quant::Q4_0;
 use tract_core::transform::ModelTransform;
 use tract_gpu::fact::{DeviceFact, DeviceTypedFactExt};
 use tract_gpu::rewrite_rules::rewire_syncs::rewire_syncs;
-use tract_gpu::rewrite_rules::rms_norm::remove_rms_norm_cast;
 use tract_gpu::sync::{DeviceSync, DeviceSyncKind};
 use tract_gpu::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice};
 use tract_gpu::utils::as_quant_fact;
-use tract_pulse_opl::ops::{Delay, PulsePad};
 use tract_transformers::ops::apply_rope::{ApplyRope, RotateHalf};
 use tract_transformers::ops::dyn_kv_cache::DynKeyValueCache;
 use tract_transformers::ops::gelu_approximate::GeluApproximate;
 use tract_transformers::ops::rms_norm::RmsNorm;
 use tract_transformers::ops::scaled_masked_softmax::ScaledMaskedSoftmax;
-use tract_transformers::ops::sdpa::Sdpa;
 use tract_transformers::ops::silu::Silu;
 
 use crate::context::cuda_context;
-use crate::ops::{CudaDelay, CudaPulsePad};
-use crate::ops::{CudaLeakyRelu, wire_cuda_conv};
+use crate::kernels::matmul::GgmlGemm;
 use crate::{kernels, ops, rewrite_rules};
 
 #[derive(Debug, Default)]
@@ -57,7 +50,7 @@ impl CudaTransform {
         // Init CUDA Context if not done previously
         cuda_context();
 
-        rewrite_einsum_to_prefix_matmul(model, false)?;
+        rewrite_einsum_to_prefix_matmul(model)?;
         if stop_at_phase == 0 {
             return Ok(());
         }
@@ -65,12 +58,6 @@ impl CudaTransform {
         Rewriter::default()
             .with_rule_for("untranspose_matmul_output", rewrite_rules::untranspose_matmul_output)
             .with_rule_for("add_broadcast_pre_matmul", rewrite_rules::add_broadcast_pre_matmul)
-            .with_rule_for("rewrite_kernel_conv_in_oihw", rewrite_kernel_conv_in_oihw)
-            .with_rule_for("rewrite_conv_with_n_axis", rewrite_conv_with_n_axis)
-            .rewrite(&(), model)?;
-
-        Rewriter::default()
-            .with_rule_for("remove_rms_norm_cast", remove_rms_norm_cast)
             .rewrite(&(), model)?;
 
         if stop_at_phase == 1 {
@@ -196,7 +183,6 @@ fn can_translate_to_cuda_op(source: &TypedModel, node: &TypedNode) -> TractResul
             || node
                 .op_as::<Silu>()
                 .is_some_and(|_| kernels::UnaryOps::is_supported_dt(input_dts[0]))
-            || node.op_as::<ElementWiseOp>().is_some_and(|op| op.0.is::<LeakyRelu>())
             || node.op_as::<ElementWiseOp>().is_some_and(|op| {
                 kernels::UnaryOps::is_supported_dt(input_dts[0])
                     && map_element_wise_ops_to_cuda(op).is_some()
@@ -216,8 +202,6 @@ fn can_translate_to_cuda_op(source: &TypedModel, node: &TypedNode) -> TractResul
             || node.op_is::<MultiBroadcastTo>()
             || node.op_is::<AxisOp>()
             || node.op_is::<Slice>()
-            || node.op_is::<Delay>()
-            || node.op_is::<PulsePad>()
             || node.op_is::<TypedConcat>()
             || node.op_is::<DynKeyValueCache>()
             || node.op_as::<Reduce>().is_some_and(|op| {
@@ -242,18 +226,13 @@ fn can_translate_to_cuda_op(source: &TypedModel, node: &TypedNode) -> TractResul
                 .is_some_and(|_| kernels::nn::ApplyRope::is_supported_dt(input_dts[0]))
             || node
                 .op_as::<GeluApproximate>()
-                .is_some_and(|_| kernels::nn::GeluApproximate::is_supported_dt(input_dts[0]))
-            || node.op_as::<Sdpa>().is_some()
-            || node.op_as::<PrefixMatMul>().is_some_and(|op| {
-                !op.transpose_c
-                    && op.quantize_output.is_none()
-                    && (can_convert_to_cuda_gemm(&input_facts)
-                        || can_convert_to_cuda_gemm(&[
-                            input_facts[1].clone(),
-                            input_facts[0].clone(),
-                        ]))
-            })
-            || (node.op_is::<Conv>() && input_facts[0].datum_type.is::<f32>())))
+                .is_some_and(|_| kernels::nn::GeluApproximate::is_supported_dt(input_dts[0])))
+        || node.op_as::<PrefixMatMul>().is_some_and(|op| {
+            !op.transpose_c
+                && op.quantize_output.is_none()
+                && (GgmlGemm.is_supported_dts(&input_facts)
+                    || GgmlGemm.is_supported_dts(&[input_facts[1].clone(), input_facts[0].clone()]))
+        }))
 }
 
 fn convert_const(op: &Const) -> TractResult<Const> {
@@ -345,16 +324,6 @@ fn convert_logic_op_to_cuda(op: &Comp) -> ops::CudaBinOp {
     }
 }
 
-fn can_convert_to_cuda_gemm(facts: &[TypedFact]) -> bool {
-    assert!(facts.len() == 2, "Ggml: Expected 2 inputs for Matmul");
-
-    let regular_types_support =
-        matches!((facts[0].datum_type, facts[1].datum_type), (F32, F32) | (F16, F16) | (F16, F32));
-
-    regular_types_support
-        || (as_quant_fact(&facts[1], &Q4_0).is_some() && matches!(facts[0].datum_type, F16 | F32))
-}
-
 fn convert_matmul_to_cuda(
     model: &TypedModel,
     node: &TypedNode,
@@ -363,12 +332,12 @@ fn convert_matmul_to_cuda(
     op: &PrefixMatMul,
 ) -> TractResult<TVec<OutletId>> {
     let mut input_facts = model.node_input_facts(node.id)?;
+
     // GGML kernel expects weights in second position and activations in first position
     // This avoid output transposition due to GGML column-major data expectations
-
     let mut swap_inputs = false;
-    if !can_convert_to_cuda_gemm(&[input_facts[0].clone(), input_facts[1].clone()])
-        && can_convert_to_cuda_gemm(&[input_facts[1].clone(), input_facts[0].clone()])
+    if !GgmlGemm.is_supported_dts(&[input_facts[0].clone(), input_facts[1].clone()])
+        && GgmlGemm.is_supported_dts(&[input_facts[1].clone(), input_facts[0].clone()])
     {
         input_facts.swap(0, 1);
         inputs.swap(0, 1);
@@ -380,11 +349,7 @@ fn convert_matmul_to_cuda(
     let outlets = inputs.split_at_mut(1);
     let act_outlet = &mut outlets.0[0];
     let weights_outlet = &mut outlets.1[0];
-
-    let transpose_act = if swap_inputs { !op.transpose_b } else { op.transpose_a };
-    let transpose_weight = if swap_inputs { !op.transpose_a } else { op.transpose_b };
-
-    if transpose_act {
+    if op.transpose_a {
         let rank = act_fact.rank();
         let perm_act_op = ops::CudaAxisOp::from_tract_core(AxisOp::Move(rank - 2, rank - 1));
         let perm_act_name = node.name.clone() + ".perm_activs";
@@ -395,13 +360,9 @@ fn convert_matmul_to_cuda(
         let in_cast_op = ops::CudaCast::new(DatumType::F32).unwrap();
         *act_outlet =
             target.wire_node(node.name.clone() + ".in_cast", in_cast_op, &[*act_outlet])?[0];
-    } else if act_fact.datum_type == DatumType::F16 && weight_fact.datum_type == DatumType::F32 {
-        let in_cast_op = ops::CudaCast::new(DatumType::F16).unwrap();
-        *weights_outlet =
-            target.wire_node(node.name.clone() + ".in_cast", in_cast_op, &[*weights_outlet])?[0];
     }
 
-    if !transpose_weight {
+    if !op.transpose_b {
         ensure!(as_quant_fact(weight_fact, &Q4_0).is_none(), "Cannot transpose Q40 tensor");
 
         let rank = weight_fact.rank();
@@ -417,6 +378,7 @@ fn convert_matmul_to_cuda(
         *act_outlet =
             target.wire_node(node.name.clone() + ".quant_activs", quant_op, &[*act_outlet])?[0];
     }
+
     let mut matmul_output =
         target.wire_node(node.name.clone(), *Box::new(ops::CudaGgmlGemm), inputs)?;
 
@@ -449,126 +411,6 @@ fn convert_matmul_to_cuda(
     Ok(matmul_output)
 }
 
-fn convert_sdpa_to_cuda_flash_attn(
-    model: &TypedModel,
-    node: &TypedNode,
-    target: &mut TypedModel,
-    inputs: &mut [OutletId],
-    op: &Sdpa,
-) -> TractResult<TVec<OutletId>> {
-    let facts = model.node_input_facts(node.id)?;
-
-    let [qf, kf, vf] = [facts[0], facts[1], facts[2]];
-    ensure!(kf.datum_type() == vf.datum_type(), "K/V dtypes must match");
-
-    let mask_fact = if facts.len() == 4 { Some(facts[3]) } else { None };
-
-    let (q, k, v, m_opt) = match &mut inputs[..] {
-        [q, k, v, m, ..] => (q, k, v, Some(m)),
-        [q, k, v] => (q, k, v, None),
-        _ => bail!("unexpected number of inputs"),
-    };
-
-    fn name(base: &str, suffix: &str) -> String {
-        format!("{base}{suffix}")
-    }
-
-    fn mut_cast(
-        target: &mut TypedModel,
-        node_name: &str,
-        dst: &mut OutletId,
-        have: DatumType,
-        want: DatumType,
-        suffix: &str,
-    ) -> TractResult<()> {
-        if have != want {
-            *dst = target.wire_node(
-                name(node_name, suffix),
-                ops::CudaCast::new(want).unwrap(),
-                &[*dst],
-            )?[0];
-        }
-        Ok(())
-    }
-
-    fn add_head_axis_if_rank3(
-        target: &mut TypedModel,
-        node_name: &str,
-        dst: &mut OutletId,
-        fact: &TypedFact,
-        suffix: &str,
-    ) -> TractResult<bool> {
-        if fact.rank() == 3 {
-            let ax = ops::CudaAxisOp::from_tract_core(AxisOp::Add(1));
-            *dst = target.wire_node(name(node_name, suffix), ax, &[*dst])?[0];
-            Ok(true)
-        } else {
-            ensure!(fact.rank() == 4, "Q/K/V must be rank 3 or 4");
-            Ok(false)
-        }
-    }
-
-    // ----- casts
-    let q_dt = qf.datum_type().unwrap();
-    let kv_dt = kf.datum_type().unwrap();
-    mut_cast(target, &node.name, k, kv_dt, DatumType::F16, ".cast_k")?;
-    mut_cast(target, &node.name, v, kv_dt, DatumType::F16, ".cast_v")?;
-    mut_cast(target, &node.name, q, q_dt, DatumType::F16, ".cast_q")?;
-
-    // ----- rank normalize
-    let mut added_head_axis = false;
-    added_head_axis |= add_head_axis_if_rank3(target, &node.name, q, qf, ".reshape_q")?;
-    added_head_axis |= add_head_axis_if_rank3(target, &node.name, k, kf, ".reshape_k")?;
-    added_head_axis |= add_head_axis_if_rank3(target, &node.name, v, vf, ".reshape_v")?;
-
-    let out_dim = kf.shape[kf.rank() - 1].to_i64()?;
-    ensure!(matches!(out_dim, 64 | 128), "Unsupported head dim (D): {out_dim}");
-    ensure!(kf.shape == vf.shape, "K and V shapes must be identical");
-
-    // ----- mask: cast & reshape
-    if let Some(mf) = mask_fact {
-        let m = m_opt.unwrap();
-        mut_cast(target, &node.name, m, mf.datum_type().unwrap(), DatumType::F16, ".cast_m")?;
-        if mf.rank() != 4 {
-            let add = 4 - mf.rank();
-            let ax = ops::CudaAxisOp::from_tract_core(AxisOp::Reshape(
-                0,
-                tvec![],
-                tvec![TDim::Val(1); add],
-            ));
-            *m = target.wire_node(name(&node.name, ".reshape_m"), ax, &[*m])?[0];
-        }
-    }
-
-    // ----- scale & op
-    let scale = op
-        .scale
-        .as_ref()
-        .map(|s| *s.to_scalar::<f32>().unwrap())
-        .unwrap_or(1.0 / (out_dim as f32).sqrt());
-    let sdpa = ops::CudaFlashAttention::new(scale, op.is_causal);
-
-    let mut out = target.wire_node(node.name.clone(), sdpa, inputs)?;
-
-    if added_head_axis {
-        out = target.wire_node(
-            name(&node.name, ".reshape_out"),
-            ops::CudaAxisOp::from_tract_core(AxisOp::Rm(1)),
-            &out,
-        )?;
-    }
-
-    if q_dt != DatumType::F16 {
-        out = target.wire_node(
-            name(&node.name, ".cast_out"),
-            ops::CudaCast::new(q_dt).unwrap(),
-            &out,
-        )?;
-    }
-
-    Ok(out)
-}
-
 impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for CudaTransform {
     fn translate_node(
         &self,
@@ -585,19 +427,11 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Cud
 
             let outlet_ids: TVec<OutletId> = if let Some(op) = node.op_as::<PrefixMatMul>() {
                 convert_matmul_to_cuda(source, node, target, &mut device_inputs, op)?
-            } else if let Some(op) = node.op_as::<Sdpa>() {
-                convert_sdpa_to_cuda_flash_attn(source, node, target, &mut device_inputs, op)?
-            } else if let Some(conv) = node.op_as::<Conv>() {
-                wire_cuda_conv(source, node, target, &device_inputs, conv)?
             } else {
                 let op: Box<dyn TypedOp> = if let Some(op) = node.op_as::<Const>() {
                     Box::new(convert_const(op)?)
                 } else if let Some(op) = node.op_as::<ElementWiseOp>() {
-                    if let Some(leaky) = op.0.downcast_ref::<LeakyRelu>() {
-                        Box::new(CudaLeakyRelu { alpha: leaky.alpha })
-                    } else {
-                        Box::new(map_element_wise_ops_to_cuda(op).unwrap())
-                    }
+                    Box::new(map_element_wise_ops_to_cuda(op).unwrap())
                 } else if let Some(op) = node.op_as::<TypedBinOp>() {
                     Box::new(map_binary_op_to_cuda(op).unwrap())
                 } else if let Some(op) = node.op_as::<Comp>() {
@@ -631,10 +465,6 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Cud
                     Box::new(ops::CudaRmsNorm::new(op.axis, op.eps.clone()))
                 } else if let Some(op) = node.op_as::<GeluApproximate>() {
                     Box::new(ops::CudaGeluApproximate { fast_impl: op.fast_impl })
-                } else if let Some(op) = node.op_as::<Delay>() {
-                    Box::new(CudaDelay::new(op.clone()))
-                } else if let Some(op) = node.op_as::<PulsePad>() {
-                    Box::new(CudaPulsePad::new(op)?)
                 } else {
                     bail!("Failed to translate a supported CUDA Op")
                 };
@@ -646,44 +476,5 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Cud
                 self.sync_inputs_if_required(target, node, mapping, DeviceSyncKind::ToHost)?;
             target.wire_node(&node.name, node.op.clone(), &cpu_inputs)
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_prefix_matmul_transform_f32_f16() -> TractResult<()> {
-        let mut model = TypedModel::default();
-        let (b, m, k, n) = (1, 16, 128, 32);
-
-        let a_fact = TypedFact::dt_shape(DatumType::F32, &[b, m, k]);
-        let b_fact = TypedFact::dt_shape(DatumType::F16, &[b, k, n]);
-
-        let source_a = model.add_source("a", a_fact)?;
-        let source_b = model.add_source("b", b_fact)?;
-
-        let op = PrefixMatMul {
-            transpose_a: false,
-            transpose_b: false,
-            transpose_c: false,
-            quantize_output: None,
-            operating_dt: Some(DatumType::F32),
-        };
-
-        let matmul_out = model.wire_node("matmul", op, &[source_a, source_b])?;
-        model.set_output_outlets(&matmul_out)?;
-
-        let tensor_a = Tensor::zero::<f32>(&[b, m, k])?;
-        let tensor_b = Tensor::zero::<f16>(&[b, k, n])?;
-        let inputs = tvec!(tensor_a.into(), tensor_b.into());
-
-        let transform = CudaTransform::default();
-        transform.transform(&mut model)?;
-
-        let cuda_runnable = model.into_runnable()?;
-        let _ = cuda_runnable.run(inputs)?;
-        Ok(())
     }
 }

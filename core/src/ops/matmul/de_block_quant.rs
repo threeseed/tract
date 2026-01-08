@@ -1,4 +1,4 @@
-use tract_linalg::block_quant::{BlockQuant, BlockQuantFact, Q4_0};
+use tract_linalg::block_quant::{BlockQuant, BlockQuantFact, BlockQuantValue, Q4_0};
 
 use crate::internal::*;
 use crate::ops::einsum::einsum_matmul::EinSumMatMul;
@@ -30,7 +30,9 @@ fn block_quant_einsum_weights(
     prefix: &str,
     op: &EinSumMatMul,
 ) -> TractResult<Option<TypedModelPatch>> {
-    rule_if!(node.inputs.len() == 2);
+    if node.inputs.len() != 2 {
+        return Ok(None);
+    }
     for (slot, fact) in model.node_input_facts(node.id)?.iter().enumerate() {
         let Some(a) = fact.konst.as_ref() else { continue };
         if a.rank() != 2 {
@@ -64,7 +66,7 @@ fn block_quant_einsum_weights(
         };
         let name = &model.node(node.inputs[0].node).name;
         let fact = BlockQuantFact::new(Box::new(format), a.shape().into());
-        let value = BlobWithFact { fact: Box::new(fact.clone()), value: Arc::new(weights) };
+        let value = BlockQuantValue { fact: fact.clone(), value: Arc::new(weights) };
         let weights = patch.wire_node(
             format!("{name}.bq"),
             Const::new_with_opaque_fact(rctensor0(Opaque(Arc::new(value))), Box::new(fact))?,

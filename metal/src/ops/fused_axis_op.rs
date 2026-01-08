@@ -5,17 +5,18 @@ use tract_core::internal::*;
 use tract_core::ops::OpStateFreeze;
 use tract_gpu::tensor::{DeviceTensor, DeviceTensorExt};
 
-#[derive(Clone, Debug, new)]
-pub struct MetalFusedAxisOp {
+#[derive(Clone, Debug, new, Hash)]
+pub struct MetalFusedAxisOp<O: TypedOp> {
     /// List of axis ops to apply for each op inputs
     /// Length of the list is equal to number of inputs
     pub grouped_axis_ops: TVec<TVec<MetalAxisOp>>,
-    pub op: Box<dyn TypedOp>,
+    pub op: O,
 }
 
 #[derive(Debug, Clone, new)]
-pub struct MetalFusedAxisOpState {
+pub struct MetalFusedAxisOpState<O: TypedOp> {
     pub op_state: Box<dyn OpState>,
+    _phantom: PhantomData<O>,
 }
 
 fn compute_reshaped_inputs(
@@ -69,7 +70,7 @@ fn compute_reshaped_inputs(
         .collect::<TractResult<TVec<_>>>()
 }
 
-impl OpState for MetalFusedAxisOpState {
+impl<O: TypedOp + Clone> OpState for MetalFusedAxisOpState<O> {
     fn init_tensor_fact(&self) -> Option<(String, TypedFact)> {
         self.op_state.init_tensor_fact()
     }
@@ -96,31 +97,38 @@ impl OpState for MetalFusedAxisOpState {
         op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
-        let fused_axis_op = op.downcast_ref::<MetalFusedAxisOp>().unwrap();
+        let fused_axis_op = op.downcast_ref::<MetalFusedAxisOp<O>>().unwrap();
         let inputs = compute_reshaped_inputs(inputs, &fused_axis_op.grouped_axis_ops, session)?;
         // Runner inner op
-        self.op_state.eval(session, fused_axis_op.op.as_op(), inputs)
+        self.op_state.eval(session, &fused_axis_op.op, inputs)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct FrozenMetalFusedAxisOpState {
+pub struct FrozenMetalFusedAxisOpState<O: TypedOp> {
     pub op_state: Box<dyn FrozenOpState>,
+    _phantom: PhantomData<O>,
 }
 
-impl OpStateFreeze for MetalFusedAxisOpState {
+impl<O: TypedOp + Clone> OpStateFreeze for MetalFusedAxisOpState<O> {
     fn freeze(&self) -> Box<dyn FrozenOpState + 'static> {
-        Box::new(FrozenMetalFusedAxisOpState { op_state: self.op_state.freeze() })
+        Box::new(FrozenMetalFusedAxisOpState {
+            op_state: self.op_state.freeze(),
+            _phantom: PhantomData::<O>,
+        })
     }
 }
 
-impl FrozenOpState for FrozenMetalFusedAxisOpState {
+impl<O: TypedOp + Clone> FrozenOpState for FrozenMetalFusedAxisOpState<O> {
     fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(MetalFusedAxisOpState { op_state: self.op_state.unfreeze() })
+        Box::new(MetalFusedAxisOpState {
+            op_state: self.op_state.unfreeze(),
+            _phantom: PhantomData::<O>,
+        })
     }
 }
 
-impl Op for MetalFusedAxisOp {
+impl<O: TypedOp + Clone> Op for MetalFusedAxisOp<O> {
     fn name(&self) -> StaticName {
         self.op.name()
     }
@@ -149,7 +157,7 @@ impl Op for MetalFusedAxisOp {
     op_as_typed_op!();
 }
 
-impl EvalOp for MetalFusedAxisOp {
+impl<O: TypedOp + Clone> EvalOp for MetalFusedAxisOp<O> {
     fn is_stateless(&self) -> bool {
         self.op.is_stateless()
     }
@@ -160,7 +168,10 @@ impl EvalOp for MetalFusedAxisOp {
         node_id: usize,
     ) -> TractResult<Option<Box<dyn OpState>>> {
         if let Some(state) = self.op.state(session, node_id)? {
-            Ok(Some(Box::new(MetalFusedAxisOpState { op_state: state })))
+            Ok(Some(Box::new(MetalFusedAxisOpState {
+                op_state: state,
+                _phantom: PhantomData::<O>,
+            })))
         } else {
             Ok(None)
         }
@@ -177,7 +188,7 @@ impl EvalOp for MetalFusedAxisOp {
     }
 }
 
-impl TypedOp for MetalFusedAxisOp {
+impl<O: TypedOp + Clone> TypedOp for MetalFusedAxisOp<O> {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         ensure!(
             inputs.len() == self.grouped_axis_ops.len(),

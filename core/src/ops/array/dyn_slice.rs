@@ -24,7 +24,11 @@ impl Op for DynSlice {
     op_as_typed_op!();
 
     fn same_as(&self, other: &dyn Op) -> bool {
-        if let Some(other) = other.downcast_ref::<Self>() { other == self } else { false }
+        if let Some(other) = other.downcast_ref::<Self>() {
+            other == self
+        } else {
+            false
+        }
     }
 }
 
@@ -83,17 +87,22 @@ impl TypedOp for DynSlice {
         io: InOut,
         change: &AxisOp,
     ) -> TractResult<Option<AxisChangeConsequence>> {
-        rule_if!(io != InOut::In(1) && io != InOut::In(2));
-        rule_if_some!(axis = change.transform_axis(self.axis));
-        if axis != self.axis {
-            Ok(Some(AxisChangeConsequence::new(
-                model,
-                node,
-                Some(Box::new(DynSlice { axis, ..self.clone() }) as _),
-                change,
-            )))
+        if io == InOut::In(1) || io == InOut::In(2) {
+            return Ok(None);
+        }
+        if let Some(axis) = change.transform_axis(self.axis) {
+            if axis != self.axis {
+                Ok(Some(AxisChangeConsequence::new(
+                    model,
+                    node,
+                    Some(Box::new(DynSlice { axis, ..self.clone() }) as _),
+                    change,
+                )))
+            } else {
+                Ok(Some(AxisChangeConsequence::new(model, node, None, change)))
+            }
         } else {
-            Ok(Some(AxisChangeConsequence::new(model, node, None, change)))
+            Ok(None)
         }
     }
 
@@ -103,17 +112,18 @@ impl TypedOp for DynSlice {
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
         let inputs = model.node_input_facts(node.id)?;
-        rule_if_some!(start = &inputs[1].konst);
-        rule_if_some!(end = &inputs[2].konst);
-        let start = start.cast_to::<TDim>()?.to_scalar::<TDim>()?.clone();
-        let end = end.cast_to::<TDim>()?.to_scalar::<TDim>()?.clone();
+        if let (Some(start), Some(end)) = (&inputs[1].konst, &inputs[2].konst) {
+            let start = start.cast_to::<TDim>()?.to_scalar::<TDim>()?.clone();
+            let end = end.cast_to::<TDim>()?.to_scalar::<TDim>()?.clone();
 
-        Ok(Some(TypedModelPatch::replace_single_op(
-            model,
-            node,
-            &[node.inputs[0]],
-            crate::ops::array::Slice { axis: self.axis, start, end },
-        )?))
+            return Ok(Some(TypedModelPatch::replace_single_op(
+                model,
+                node,
+                &[node.inputs[0]],
+                crate::ops::array::Slice { axis: self.axis, start, end },
+            )?));
+        }
+        Ok(None)
     }
 
     as_op!();

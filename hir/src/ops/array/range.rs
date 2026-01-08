@@ -25,11 +25,7 @@ impl Expansion for Range {
             move |s, dt0, dt1, dt2| {
                 let dt =
                     DatumType::super_type_for([dt0, dt1, dt2]).context("No supertype found")?;
-                if dt.is_tdim() {
-                    s.equals(&outputs[0].datum_type, i64::datum_type())
-                } else {
-                    s.equals(dt, &outputs[0].datum_type)
-                }
+                s.equals(dt, &outputs[0].datum_type)
             },
         )?;
         s.equals(&inputs[0].rank, 0)?;

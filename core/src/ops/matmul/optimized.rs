@@ -1,5 +1,5 @@
 use crate::internal::*;
-use crate::ops::cast::{Cast, cast};
+use crate::ops::cast::cast;
 use crate::ops::change_axes::wire_with_rank_broadcast;
 use crate::ops::nn::LeakyRelu;
 use ndarray::*;
@@ -433,14 +433,21 @@ impl TypedOp for OptMatMul {
 
     fn fuse(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
         use crate::ops;
-        rule_if!(node.outputs.len() == 1);
-        rule_if!(node.outputs[0].successors.len() == 1);
-        rule_if!(!model.output_outlets()?.contains(&node.id.into()));
+        if node.outputs.len() != 1
+            || node.outputs[0].successors.len() != 1
+            || model.output_outlets()?.contains(&node.id.into())
+        {
+            return Ok(None);
+        }
         let succ = model.node(node.outputs[0].successors[0].node);
         let mut patch = TypedModelPatch::new(format!("fusing {succ}"));
 
         if let Some(op) = succ.op_as::<ops::binary::TypedBinOp>() {
-            rule_if_some!(mut binop = op.0.as_linalg_binop());
+            let mut binop = if let Some(op) = op.0.as_linalg_binop() {
+                op
+            } else {
+                return Ok(None);
+            };
             let flipped = succ.inputs[0].node == node.id;
             if flipped {
                 binop = binop.flip();
@@ -449,7 +456,11 @@ impl TypedOp for OptMatMul {
             return self.fuse_binary(model, node, patch, other_outlet, binop);
         }
         if let Some(op) = succ.op_as::<ops::binary::OptBinByScalar>() {
-            rule_if_some!(mut binop = op.binop.as_linalg_binop());
+            let mut binop = if let Some(op) = op.binop.as_linalg_binop() {
+                op
+            } else {
+                return Ok(None);
+            };
             let flipped = succ.inputs[0].node == node.id;
             if flipped {
                 binop = binop.flip();
@@ -469,11 +480,13 @@ impl TypedOp for OptMatMul {
                 );
             }
             if let Some(op) = op.downcast_ref::<LeakyRelu>() {
-                rule_if!(
-                    self.mmm
-                        .iter()
-                        .all(|mmm| mmm.can_fuse(&FusedSpec::LeakyRelu(&tensor0(op.alpha))))
-                );
+                if !self
+                    .mmm
+                    .iter()
+                    .all(|mmm| mmm.can_fuse(&FusedSpec::LeakyRelu(&tensor0(op.alpha))))
+                {
+                    return Ok(None);
+                }
                 let alpha = patch.add_const(
                     node.name.to_string() + ".alpha",
                     tensor0(op.alpha).cast_to_dt(self.mmm[0].internal_type())?.into_owned(),
@@ -488,10 +501,9 @@ impl TypedOp for OptMatMul {
             }
         }
         if let Some(cast_to) = succ.op_as::<ops::cast::Cast>().map(|cast| cast.to) {
-            if ((cast_to.unquantized() == i8::datum_type()
+            if (cast_to.unquantized() == i8::datum_type()
                 || cast_to.unquantized() == u8::datum_type())
-                && self.c_fact.datum_type == i32::datum_type())
-                || self.mmm.iter().all(|m| m.stores().contains(&cast_to))
+                && self.c_fact.datum_type == i32::datum_type()
             {
                 if let Some(ProtoFusedSpec::Store(stores)) = self.micro_ops.last() {
                     if stores.iter().any(|s| matches!(s, OutputStoreSpec::Strides { .. })) {
@@ -509,8 +521,9 @@ impl TypedOp for OptMatMul {
             }
         }
         if let Some(AxisOp::Rm(axis)) = succ.op_as::<ops::AxisOp>() {
-            rule_if!(Some(*axis) != self.c_m_axis);
-            rule_if!(Some(*axis) != self.c_n_axis);
+            if Some(*axis) == self.c_m_axis || Some(*axis) == self.c_n_axis {
+                return Ok(None);
+            }
             let mut new_op = self.clone();
             new_op.c_fact.shape.remove_axis(*axis)?;
             if let Some(c_m_axis) = &mut new_op.c_m_axis {
@@ -526,33 +539,28 @@ impl TypedOp for OptMatMul {
             patch.dont_apply_twice = Some(format!("Fuse {succ} into {node}"));
             return Ok(Some(patch));
         }
-        if succ.op_is::<AxisOp>() || succ.op_is::<IntoShape>() {
+        if succ.op_is::<AxisOp>() {
             if let &[next] = &*succ.outputs[0].successors {
-                let next_node = model.node(next.node);
-                if let Some(cast) = next_node.op_as::<Cast>() {
-                    let mut patch = TypedModelPatch::default();
-                    let mut wire = patch.tap_model(model, node.id.into())?;
-                    wire = patch.wire_node(&next_node.name, cast.clone(), &[wire])?[0];
-                    wire = patch.wire_node(&succ.name, succ.op.clone(), &[wire])?[0];
-                    patch.shunt_outside(model, next_node.id.into(), wire)?;
-                    return Ok(Some(patch));
-                } else if let Some(op) = next_node.op_as::<ops::binary::TypedBinOp>() {
-                    rule_if!(op.0.as_linalg_binop().is_some());
+                let bin = model.node(next.node);
+                if let Some(op) = bin.op_as::<ops::binary::TypedBinOp>() {
+                    if op.0.as_linalg_binop().is_none() {
+                        return Ok(None);
+                    };
                     let flipped = succ.inputs[0].node == node.id;
-                    let other_outlet = next_node.inputs[flipped as usize];
+                    let other_outlet = bin.inputs[flipped as usize];
                     if let Some(uni) = &model.outlet_fact(other_outlet)?.uniform {
                         let mut patch = TypedModelPatch::default();
                         let cst =
                             patch.add_const(&model.node(other_outlet.node).name, uni.clone())?;
                         let output = patch.tap_model(model, node.id.into())?;
                         let wire = wire_with_rank_broadcast(
-                            &next_node.name,
+                            &bin.name,
                             &mut patch,
                             op.clone(),
                             &if flipped { [output, cst] } else { [cst, output] },
                         )?;
                         let wire = patch.wire_node(&succ.name, succ.op.clone(), &wire)?[0];
-                        patch.shunt_outside(model, next_node.id.into(), wire)?;
+                        patch.shunt_outside(model, bin.id.into(), wire)?;
                         return Ok(Some(patch));
                     }
                 }
@@ -583,7 +591,11 @@ impl TypedOp for OptMatMul {
                     );
                 }
             } else {
-                rule_if_some!(mut binop = op.binop.as_linalg_binop());
+                let mut binop = if let Some(op) = op.binop.as_linalg_binop() {
+                    op
+                } else {
+                    return Ok(None);
+                };
                 let flipped = succ.inputs[0].node == node.id;
                 if flipped {
                     binop = binop.flip();
@@ -634,7 +646,11 @@ impl OptMatMul {
             .iter()
             .find_map(
                 |o| {
-                    if let ProtoFusedSpec::AddMatMul { geo, .. } = o { Some(geo) } else { None }
+                    if let ProtoFusedSpec::AddMatMul { geo, .. } = o {
+                        Some(geo)
+                    } else {
+                        None
+                    }
                 },
             )
             .map(|geo| geo.k.clone())

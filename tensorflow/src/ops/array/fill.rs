@@ -7,6 +7,8 @@ pub struct Fill {
     dt: DatumType,
 }
 
+
+
 pub fn fill(_ctx: &ParsingContext, pb: &NodeDef) -> TractResult<Box<dyn InferenceOp>> {
     let dtype = pb.get_attr_datum_type("T")?;
     Ok(Box::new(Fill::new(dtype)))

@@ -124,6 +124,7 @@ impl Arbitrary for QBinaryOpProblem {
 impl Test for QBinaryOpProblem {
     fn run_with_approx(
         &self,
+        _suite: &str,
         id: &str,
         runtime: &dyn Runtime,
         approx: Approximation,

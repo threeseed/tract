@@ -20,12 +20,8 @@ fn mk_suite() -> infra::TestSuite {
 
     let mut unit = suite_unit::suite().unwrap().clone();
     unit.ignore_case(&ignore_unit);
-    let cv = ConvProblemParams {
-        no_group: true,
-        no_dilations: true,
-        geo_rank: Some(1..3),
-        ..ConvProblemParams::default()
-    };
+    let cv =
+        ConvProblemParams { no_group: true, geo_rank: Some(1..3), ..ConvProblemParams::default() };
     unit.get_sub_mut("conv_f32").add_arbitrary::<ConvProblem>("proptest", cv.clone());
     unit.get_sub_mut("conv_q").add_arbitrary_with_filter::<QConvProblem>(
         "proptest",
@@ -184,9 +180,7 @@ fn ignore_unit(t: &[String], case: &dyn Test) -> bool {
 }
 
 fn compatible_conv_f32(qcp: &ConvProblem) -> bool {
-    qcp.group == 1
-        && (qcp.kernel.ndim() == 4 || qcp.kernel.ndim() == 3)
-        && qcp.dilations.iter().all(|d| *d == 1)
+    qcp.group == 1 && (qcp.kernel.ndim() == 4 || qcp.kernel.ndim() == 3)
 }
 
 fn compatible_conv_q(qcp: &QConvProblem) -> bool {

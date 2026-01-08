@@ -38,9 +38,9 @@ mod tensor;
 mod utils;
 
 use params::*;
-use tract_linalg::WeightType;
 use tract_linalg::block_quant::Q4_0;
 use tract_linalg::mmm::MatMatMul;
+use tract_linalg::WeightType;
 
 readings_probe::instrumented_allocator!();
 
@@ -545,13 +545,6 @@ fn run_options(command: clap::Command) -> clap::Command {
             Arg::new("cuda-gpu-trace")
                 .long("cuda-gpu-trace")
                 .help("Capture CUDA GPU trace. Must be used with nsys profile -c cudaProfilerApi before cargo command")
-        )
-        .arg(
-            Arg::new("prompt-chunk-size")
-                .long("prompt-chunk-size")
-                .takes_value(true)
-                .number_of_values(1)
-                .help("Set prompt chunk size. Help splitting too big prompts")
         )
 }
 

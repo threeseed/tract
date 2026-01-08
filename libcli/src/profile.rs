@@ -3,7 +3,6 @@ use crate::tensor::RunTensors;
 use crate::tensor::make_inputs_for_model;
 use crate::{annotations::*, capture_gpu_trace};
 use std::any::TypeId;
-use std::borrow::Borrow;
 use std::time::{Duration, Instant};
 use tract_core::internal::*;
 use tract_core::num_traits::Zero;
@@ -29,15 +28,12 @@ impl Default for BenchLimits {
 }
 
 impl BenchLimits {
-    pub fn warmup<M: Borrow<TypedModel>>(
-        &self,
-        runnable: &TypedRunnableModel<M>,
-        inputs: &RunTensors,
-    ) -> TractResult<()> {
+    pub fn warmup(&self, model: &TypedModel, inputs: &RunTensors) -> TractResult<()> {
         if self.warmup_time.is_zero() && self.warmup_loops.is_zero() {
             return Ok(());
         }
-        let mut state = TypedSimpleState::new(runnable)?;
+        let plan = TypedSimplePlan::new(model.clone())?;
+        let mut state = TypedSimpleState::new(Arc::new(plan))?;
         let mut iters = 0;
         let max_loops = if self.warmup_loops.is_zero() { usize::MAX } else { self.warmup_loops };
         let max_time = if self.warmup_time.is_zero() { Duration::MAX } else { self.warmup_time };
@@ -73,9 +69,9 @@ pub fn profile(
     let mut iters = 0usize;
     let prefix = tvec!();
 
-    let plan = TypedSimplePlan::new_with_options(model.clone(), plan_options)?;
-    bench_limits.warmup(&plan, inputs)?;
+    bench_limits.warmup(model, inputs)?;
 
+    let plan = TypedSimplePlan::new_with_options(model.clone(), plan_options)?;
     let mut state = TypedSimpleState::new(Arc::new(plan))?;
 
     let mut dur = Duration::default();
@@ -85,18 +81,16 @@ pub fn profile(
             state.init_states(&mut inputs.state_initializers.clone())?;
         }
         let start = Instant::now();
-        for source in &inputs.sources {
-            rec_profiler(
-                &mut state,
-                dg,
-                source,
-                custom_profiler.as_ref(),
-                &prefix,
-                None,
-                &mut time_accounted_by_inner_nodes,
-                folded,
-            )?;
-        }
+        rec_profiler(
+            &mut state,
+            dg,
+            &inputs.sources[0],
+            custom_profiler.as_ref(),
+            &prefix,
+            None,
+            &mut time_accounted_by_inner_nodes,
+            folded,
+        )?;
         dur += start.elapsed();
         if !state.model().properties().contains_key("pulse.delay") {
             state.reset_op_states()?;
@@ -139,9 +133,9 @@ pub fn profile_gpu(
     let mut iters = 0usize;
     let prefix = tvec!();
 
-    let mut plan = TypedSimplePlan::new_with_options(model.clone(), plan_options)?;
-    bench_limits.warmup(&plan, inputs)?;
+    bench_limits.warmup(model, inputs)?;
 
+    let mut plan = TypedSimplePlan::new_with_options(model.clone(), plan_options)?;
     let state = TypedSimpleState::new_from_inputs(&plan, inputs.sources[0].clone())?;
 
     let session_handler = tract_gpu::session_handler::DeviceSessionHandler::from_plan(
@@ -160,9 +154,7 @@ pub fn profile_gpu(
                 state.init_states(&mut inputs.state_initializers.clone())?;
             }
             let start = Instant::now();
-            for source in &inputs.sources {
-                rec_profiler_gpu(&mut state, dg, source, &prefix)?;
-            }
+            rec_profiler_gpu(&mut state, dg, &inputs.sources[0], &prefix)?;
             dur += start.elapsed();
             if !state.model().properties().contains_key("pulse.delay") {
                 state.reset_op_states()?;

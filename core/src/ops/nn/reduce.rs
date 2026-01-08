@@ -257,6 +257,34 @@ fn argmax_t<T>(v: ArrayViewD<T>, last: bool) -> i64
 where
     T: Copy + Datum + num_traits::Bounded + ::std::cmp::PartialOrd,
 {
+    if T::datum_type() == f32::datum_type() {
+        if let Some(slice) = v.as_slice() {
+            // Fast path: use linalg max reducer to get the max value, then find index.
+            let slice_f32: &[f32] = unsafe { std::mem::transmute(slice) };
+            let max_val = (tract_linalg::ops().max_f32)().run(slice_f32).unwrap();
+            // Try AVX-512 accelerated index search on x86_64 if available.
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx512f") {
+                if let Some(ix) = unsafe { argmax_index_f32_avx512(slice_f32, max_val, last) } {
+                    return ix as i64;
+                }
+            }
+            if last {
+                for (i, &x) in slice_f32.iter().enumerate().rev() {
+                    if x == max_val {
+                        return i as i64;
+                    }
+                }
+            } else {
+                for (i, &x) in slice_f32.iter().enumerate() {
+                    if x == max_val {
+                        return i as i64;
+                    }
+                }
+            }
+            return 0;
+        }
+    }
     v.iter()
         .copied()
         .enumerate()
@@ -267,6 +295,58 @@ where
             },
         )
         .0 as i64
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn argmax_index_f32_avx512(slice: &[f32], target: f32, last: bool) -> Option<usize> {
+    use std::arch::x86_64::*;
+    if slice.is_empty() {
+        return None;
+    }
+    let lanes = 16usize;
+    let zt = _mm512_set1_ps(target);
+    if last {
+        // scan from end in chunks of 16
+        let mut i = slice.len();
+        while i >= lanes {
+            let base = i - lanes;
+            let p = slice.as_ptr().add(base) as *const __m512;
+            let v = _mm512_loadu_ps(p);
+            let mask = _mm512_cmp_ps_mask(v, zt, _MM_CMPINT_OEQ);
+            if mask != 0 {
+                // highest set bit in mask
+                let idx = 15 - mask.leading_zeros() as usize;
+                return Some(base + idx);
+            }
+            i -= lanes;
+        }
+        // tail
+        for j in (0..i).rev() {
+            if slice[j] == target {
+                return Some(j);
+            }
+        }
+        None
+    } else {
+        let mut i = 0usize;
+        while i + lanes <= slice.len() {
+            let p = slice.as_ptr().add(i) as *const __m512;
+            let v = _mm512_loadu_ps(p);
+            let mask = _mm512_cmp_ps_mask(v, zt, _MM_CMPINT_OEQ);
+            if mask != 0 {
+                let idx = mask.trailing_zeros() as usize; // first set bit
+                return Some(i + idx);
+            }
+            i += lanes;
+        }
+        for j in i..slice.len() {
+            if slice[j] == target {
+                return Some(j);
+            }
+        }
+        None
+    }
 }
 
 fn argmin_t<T>(v: ArrayViewD<T>, last: bool) -> i64
@@ -430,8 +510,11 @@ impl TypedOp for Reduce {
     ) -> TractResult<Option<AxisChangeConsequence>> {
         let mut axes = tvec!();
         for reduced in &self.axes {
-            rule_if_some!(axis = change.transform_axis(*reduced));
-            axes.push(axis);
+            if let Some(axis) = change.transform_axis(*reduced) {
+                axes.push(axis);
+            } else {
+                return Ok(None);
+            }
         }
         axes.sort();
         let op = Some(Box::new(Self { axes, ..self.clone() }) as _);
@@ -449,7 +532,9 @@ impl TypedOp for Reduce {
         _start: &TDim,
         _end: &TDim,
     ) -> TractResult<Option<TVec<OutletId>>> {
-        rule_if!(!self.axes.contains(&output_axis));
+        if self.axes.contains(&output_axis) {
+            return Ok(None);
+        }
         patch.wire_node(&node.name, &node.op, inputs).map(Some)
     }
 
@@ -462,11 +547,16 @@ impl Reduce {
         model: &TypedModel,
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
+        let Some(prec) = model.linear_prec(node.id)? else {
+            return Ok(None);
+        };
+        let Some(prec_reduce) = prec.op_as::<Self>() else {
+            return Ok(None);
+        };
         use Reducer::*;
-        rule_if_some!(prec = model.linear_prec(node.id)?);
-        rule_if_some!(prec_reduce = prec.op_as::<Self>());
-        rule_if!(prec_reduce.reducer == self.reducer);
-        rule_if!([Sum, Prod, Min, Max].contains(&self.reducer));
+        if prec_reduce.reducer != self.reducer || ![Sum, Prod, Min, Max].contains(&self.reducer) {
+            return Ok(None);
+        }
         let mut patch = TypedModelPatch::default();
         let wire = patch.tap_model(model, prec.inputs[0])?;
         let wire = patch.wire_node(
@@ -494,15 +584,22 @@ impl Reduce {
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
         if self.reducer == Reducer::Sum {
-            rule_if_some!(prec = model.linear_prec(node.id)?);
-            rule_if_some!(prec_bin = prec.op_as::<TypedBinOp>());
-            rule_if!(prec_bin.0.is::<Mul>());
+            let Some(prec) = model.linear_prec(node.id)? else {
+                return Ok(None);
+            };
+            let Some(prec_bin) = prec.op_as::<TypedBinOp>() else {
+                return Ok(None);
+            };
+            if !prec_bin.0.is::<Mul>() {
+                return Ok(None);
+            }
             let mul_input_fact = model.node_input_facts(prec.id)?;
-            rule_if_some!(
-                scalar_slot = mul_input_fact
-                    .iter()
-                    .position(|f| f.konst.as_ref().is_some_and(|k| k.volume() == 1))
-            );
+            let Some(scalar_slot) = mul_input_fact
+                .iter()
+                .position(|f| f.konst.as_ref().is_some_and(|k| k.volume() == 1))
+            else {
+                return Ok(None);
+            };
             let mut patch = TypedModelPatch::default();
             let scalar = patch.tap_model(model, prec.inputs[scalar_slot])?;
             let wire = patch.tap_model(model, prec.inputs[1 - scalar_slot])?;
@@ -520,20 +617,37 @@ impl Reduce {
         node: &TypedNode,
     ) -> TractResult<Option<TypedModelPatch>> {
         if self.reducer == Reducer::Sum {
-            rule_if_some!(prec = model.linear_prec(node.id)?);
-            rule_if_some!(prec_ew = prec.op_as::<ElementWiseOp>());
-            rule_if!(prec_ew.0.is::<Square>());
-            rule_if!(node.outputs.len() == 1);
-            rule_if!(node.outputs[0].successors.len() == 1);
+            let Some(prec) = model.linear_prec(node.id)? else {
+                return Ok(None);
+            };
+            let Some(prec_ew) = prec.op_as::<ElementWiseOp>() else {
+                return Ok(None);
+            };
+            if !prec_ew.0.is::<Square>() {
+                return Ok(None);
+            }
+            if node.outputs.len() != 1 || node.outputs[0].successors.len() != 1 {
+                return Ok(None);
+            }
             let our_inlet = node.outputs[0].successors[0];
             let succ = model.node(our_inlet.node);
-            rule_if_some!(succ_bin = succ.op_as::<TypedBinOp>());
-            rule_if!(succ_bin.0.is::<Mul>());
+            let Some(succ_bin) = succ.op_as::<TypedBinOp>() else {
+                return Ok(None);
+            };
+            if !succ_bin.0.is::<Mul>() {
+                return Ok(None);
+            }
             let other = succ.inputs[1 - our_inlet.slot];
-            rule_if_some!(other_konst = model.outlet_fact(other)?.uniform.as_ref());
+            let Some(other_konst) = model.outlet_fact(other)?.uniform.as_ref() else {
+                return Ok(None);
+            };
             let norm: TDim = self.axes.iter().map(|&ax| &prec.outputs[0].fact.shape[ax]).product();
-            rule_if_some!(norm = norm.as_i64());
-            rule_if!(norm > 0);
+            let Some(norm) = norm.as_i64() else {
+                return Ok(None);
+            };
+            if norm == 0 {
+                return Ok(None);
+            }
             let norm = tensor0((norm as f32).recip());
             if other_konst.close_enough(&norm, Approximation::Close).is_ok() {
                 let mut patch = TypedModelPatch::default();
@@ -558,35 +672,43 @@ pub fn expand_mean_of_squares(
     name: &str,
     op: &Reduce,
 ) -> TractResult<Option<TypedModelPatch>> {
-    rule_if!(op.reducer == Reducer::MeanOfSquares);
-    let mut patch = TypedModelPatch::default();
-    let mut wire = tvec!(patch.tap_model(model, node.inputs[0])?);
-    let input_fact = model.outlet_fact(node.inputs[0])?;
-    let dt = input_fact.datum_type;
-    if dt != f32::datum_type() {
-        wire = patch.wire_node(format!("{name}.to_f32"), cast(f32::datum_type()), &wire)?;
-    }
-    wire = patch.wire_node(format!("{name}.sqr"), square(), &wire)?;
-    wire = patch.wire_node(
-        format!("{name}.sum"),
-        Reduce::new(op.axes.clone(), Reducer::Sum),
-        &wire,
-    )?;
-    let card = input_fact
-        .shape
-        .iter()
-        .enumerate()
-        .filter(|(ix, _dim)| op.axes.contains(ix))
-        .map(|(_ix, dim)| dim)
-        .product::<TDim>();
-    let card = patch.add_const(format!("{name}.card"), tensor0(card))?;
-    let card = patch.wire_node(format!("{name}.card_to_f32"), cast(f32::datum_type()), &[card])?;
+    if op.reducer == Reducer::MeanOfSquares {
+        let mut patch = TypedModelPatch::default();
+        let mut wire = tvec!(patch.tap_model(model, node.inputs[0])?);
+        let input_fact = model.outlet_fact(node.inputs[0])?;
+        let dt = input_fact.datum_type;
+        if dt != f32::datum_type() {
+            wire = patch.wire_node(format!("{name}.to_f32"), cast(f32::datum_type()), &wire)?;
+        }
+        wire = patch.wire_node(format!("{name}.sqr"), square(), &wire)?;
+        wire = patch.wire_node(
+            format!("{name}.sum"),
+            Reduce::new(op.axes.clone(), Reducer::Sum),
+            &wire,
+        )?;
+        let card = input_fact
+            .shape
+            .iter()
+            .enumerate()
+            .filter(|(ix, _dim)| op.axes.contains(ix))
+            .map(|(_ix, dim)| dim)
+            .product::<TDim>();
+        let card = patch.add_const(format!("{name}.card"), tensor0(card))?;
+        let card =
+            patch.wire_node(format!("{name}.card_to_f32"), cast(f32::datum_type()), &[card])?;
 
-    wire =
-        wire_with_rank_broadcast(format!("{name}.norm"), &mut patch, div(), &[wire[0], card[0]])?;
-    if dt != f32::datum_type() {
-        wire = patch.wire_node(format!("{name}.from_f32"), cast(dt), &wire)?;
+        wire = wire_with_rank_broadcast(
+            format!("{name}.norm"),
+            &mut patch,
+            div(),
+            &[wire[0], card[0]],
+        )?;
+        if dt != f32::datum_type() {
+            wire = patch.wire_node(format!("{name}.from_f32"), cast(dt), &wire)?;
+        }
+        patch.shunt_outside(model, node.id.into(), wire[0])?;
+        Ok(Some(patch))
+    } else {
+        Ok(None)
     }
-    patch.shunt_outside(model, node.id.into(), wire[0])?;
-    Ok(Some(patch))
 }

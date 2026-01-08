@@ -14,10 +14,10 @@ macro_rules! tanh_impl {
 #[cfg(test)]
 #[macro_use]
 pub mod test {
-    use crate::LADatum;
     use crate::frame::element_wise::*;
-    use num_traits::AsPrimitive;
+    use crate::LADatum;
     use num_traits::float::Float;
+    use num_traits::AsPrimitive;
     use proptest::test_runner::TestCaseResult;
 
     #[macro_export]

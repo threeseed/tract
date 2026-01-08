@@ -5,7 +5,6 @@ use tract_core::internal::*;
 use tract_gpu::tensor::DeviceTensor;
 
 use crate::context::{TractCudaStream, cuda_context};
-use crate::kernels::launch_args::TractLaunchArgs;
 use crate::kernels::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
@@ -80,7 +79,7 @@ impl UnaryOps {
         matches!(dt, DatumType::F32 | DatumType::F16)
     }
 
-    pub fn name(&self) -> Cow<'_, str> {
+    pub fn name<'s>(&'s self) -> Cow<'s, str> {
         format!("{self}").into()
     }
     pub fn all_functions() -> Vec<String> {
@@ -164,11 +163,13 @@ impl UnaryOps {
         let o_view = get_cuda_view(output);
 
         let cfg = LaunchConfig::for_num_elems(len as _);
-        let mut launch_args = TractLaunchArgs::new(stream, &func);
-        launch_args.push_view(&i_view);
-        launch_args.push_view(&o_view);
-        launch_args.push_i32(len);
+        let mut launch_args = stream.launch_builder(&func);
+        launch_args.arg(&i_view);
+        launch_args.arg(&o_view);
+        launch_args.arg(&len);
 
-        launch_args.launch(cfg)
+        unsafe { launch_args.launch(cfg) }?;
+
+        Ok(())
     }
 }

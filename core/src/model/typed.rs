@@ -6,6 +6,7 @@ use crate::optim::OptimizerSession;
 use crate::plan::{FrozenSimpleState, SimplePlan, SimpleState};
 use crate::transform::ModelTransform;
 use tract_data::TooEarly;
+use tract_linalg::block_quant::BlockQuantValue;
 use tract_num_traits::Zero;
 
 /// A model with completely determined types and shapes.
@@ -85,9 +86,7 @@ impl SpecialOps<TypedFact, Box<dyn TypedOp>> for TypedModel {
                     })
                     .collect::<Option<TVec<_>>>()
                 {
-                    if let Ok(outputs) =
-                        op.eval_with_session(usize::MAX, &SessionState::default(), tensors)
-                    {
+                    if let Ok(outputs) = op.eval_with_session(usize::MAX, &SessionState::default(), tensors) {
                         return outputs
                             .into_iter()
                             .enumerate()
@@ -150,8 +149,8 @@ impl SpecialOps<TypedFact, Box<dyn TypedOp>> for TypedModel {
         let name = name.into();
         // this feel incredibly hackish and dirty...
         if v.datum_type().is_opaque() && v.volume() == 1 {
-            if let Some(bwf) = v.as_slice::<Opaque>()?[0].downcast_ref::<BlobWithFact>() {
-                let opaque = bwf.fact.clone();
+            if let Some(bqv) = v.as_slice::<Opaque>()?[0].downcast_ref::<BlockQuantValue>() {
+                let opaque = Box::new(bqv.fact.clone());
                 fact.opaque_fact = Some(opaque.clone());
                 return self
                     .add_node(
@@ -205,12 +204,7 @@ impl TypedModel {
             {
                 bail!(
                     "Inconsistent model, output types mismatch. Op says: {:?}, node says: {:?}. {} with inputs {:?}. {}",
-                    output_facts,
-                    node.outputs.iter().map(|o| &o.fact).collect::<Vec<_>>(),
-                    node,
-                    input_facts,
-                    node
-                )
+                    output_facts, node.outputs.iter().map(|o| &o.fact).collect::<Vec<_>>(), node, input_facts, node)
             }
             /* this is not true for regularly packed values
             if let Some(k) = node.op_as::<Const>() {
