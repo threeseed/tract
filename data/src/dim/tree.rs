@@ -170,9 +170,8 @@ impl TDim {
             return Val(*v);
         }
         let scope = self.find_scope().unwrap();
-        let scope = scope.0;
-        let locked = scope.lock();
-        let scope = locked.borrow();
+        let scope = scope.0.clone();
+        let scope = scope.read();
         self.clone().simplify_rec(&scope, Some(scenario))
     }
 
@@ -311,9 +310,8 @@ impl TDim {
         let Some(scope) = self.find_scope() else {
             return self;
         };
-        let scope = scope.0;
-        let locked = scope.lock();
-        let scope = locked.borrow();
+        let scope = scope.0.clone();
+        let scope = scope.read();
         let it = self.simplify_rec(&scope, None);
         let mut current: Option<TDim> = None;
         for scenario in scope.scenarios() {
@@ -665,8 +663,7 @@ impl TDim {
             return Some(*v);
         }
         let scope = self.find_scope()?;
-        let data = scope.0.lock();
-        let data = data.borrow();
+        let data = scope.0.read();
         self.inclusive_bound(&data, false)
     }
 
@@ -675,8 +672,7 @@ impl TDim {
             return Some(*v);
         }
         let scope = self.find_scope()?;
-        let data = scope.0.lock();
-        let data = data.borrow();
+        let data = scope.0.read();
         self.inclusive_bound(&data, true)
     }
 
@@ -685,8 +681,7 @@ impl TDim {
             return *v >= 0;
         }
         let Some(scope) = self.find_scope() else { return false };
-        let data = scope.0.lock();
-        let data = data.borrow();
+        let data = scope.0.read();
         data.prove_positive_or_zero(self)
     }
 
@@ -796,6 +791,28 @@ impl TDim {
 
     #[allow(clippy::mutable_key_type)]
     pub fn symbols(&self) -> std::collections::HashSet<Symbol> {
+        if let Some(scope) = self.find_scope() {
+            let lock = scope.0.read();
+            if let Some(cached) = lock.symbols_cache_get(self) {
+                return cached;
+            }
+            drop(lock);
+            let computed = match self {
+                Val(_) => maplit::hashset!(),
+                Sym(s) => maplit::hashset!(s.clone()),
+                Add(terms) | Mul(terms) | Broadcast(terms) | Min(terms) | Max(terms) => {
+                    terms.iter().fold(maplit::hashset!(), |mut set, v| {
+                        set.extend(v.symbols());
+                        set
+                    })
+                }
+                MulInt(_, a) => a.symbols(),
+                Div(a, _) => a.symbols(),
+            };
+            let lock = scope.0.read();
+            lock.symbols_cache_put(self.clone(), computed.clone());
+            return computed;
+        }
         match self {
             Val(_) => maplit::hashset!(),
             Sym(s) => maplit::hashset!(s.clone()),
