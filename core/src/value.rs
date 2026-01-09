@@ -1,6 +1,6 @@
 use crate::internal::*;
 use std::ops::Deref;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use TValue::*;
 use tract_ndarray::Array;
@@ -8,7 +8,7 @@ use tract_ndarray::Array;
 #[derive(Clone, Eq)]
 pub enum TValue {
     Const(Arc<Tensor>),
-    Var(Rc<Tensor>),
+    Var(Arc<Tensor>),
 }
 
 impl std::fmt::Debug for TValue {
@@ -26,7 +26,7 @@ impl PartialEq for TValue {
 impl TValue {
     pub fn is_exclusive(&self) -> bool {
         match self {
-            Var(it) => Rc::strong_count(it) == 1,
+            Var(it) => Arc::strong_count(it) == 1,
             Const(_) => false,
         }
     }
@@ -45,7 +45,7 @@ impl TValue {
 
 impl From<Tensor> for TValue {
     fn from(t: Tensor) -> Self {
-        TValue::Var(std::rc::Rc::new(t))
+        TValue::Var(Arc::new(t))
     }
 }
 
@@ -68,7 +68,7 @@ impl std::borrow::Borrow<Tensor> for TValue {
 impl IntoTensor for TValue {
     fn into_tensor(self) -> Tensor {
         match self {
-            Var(it) => Rc::try_unwrap(it).unwrap_or_else(|t| (*t).clone()),
+            Var(it) => Arc::try_unwrap(it).unwrap_or_else(|t| (*t).clone()),
             Const(it) => it.into_tensor(),
         }
     }
