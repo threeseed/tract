@@ -186,6 +186,7 @@ num-integer = "0.1.44"
 num-traits = "0.2.14"
 num_cpus = "1"
 openblas-src = { version = "0.10", features = ["static"] }
+ouroboros = "0.18"
 pastey = "0.1"
 potential_utf = "0.1.0"
 proptest = "1.0.0"

@@ -3,7 +3,7 @@ use crate::model::*;
 use crate::ops;
 use crate::ops::konst::Const;
 use crate::optim::OptimizerSession;
-use crate::plan::{FrozenSimpleState, SimplePlan, SimpleState};
+use crate::plan::{FrozenSimpleState, OwnedSimplePlan, OwnedSimpleState, SimplePlan, SimpleState};
 use crate::transform::ModelTransform;
 use tract_data::TooEarly;
 use tract_num_traits::Zero;
@@ -22,6 +22,11 @@ pub type TypedRunnableModel<M> = RunnableModel<TypedFact, Box<dyn TypedOp>, M>;
 pub type TypedSimpleState<M, P> = SimpleState<TypedFact, Box<dyn TypedOp>, M, P>;
 /// An execution state for TypedModel, frozen (and Send).
 pub type TypedFrozenSimpleState<M, P> = FrozenSimpleState<TypedFact, Box<dyn TypedOp>, M, P>;
+
+/// Self-referential plan that owns the model (reduced cloning).
+pub type TypedOwnedSimplePlan = OwnedSimplePlan<TypedFact, Box<dyn TypedOp>>;
+/// Self-referential state with borrowed plan (reduced cloning).
+pub type TypedOwnedSimpleState<'plan> = OwnedSimpleState<'plan, TypedFact, Box<dyn TypedOp>>;
 
 /// A runnable model with fixed inputs and outputs.
 pub type RunnableModel<F, O, M> = SimplePlan<F, O, M>;

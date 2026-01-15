@@ -4,6 +4,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use multithread::Executor;
+use ouroboros::self_referencing;
 use tract_data::itertools::Itertools;
 
 use crate::internal::*;
@@ -76,7 +77,8 @@ where
     M: Borrow<Graph<F, O>>,
 {
     model: M,
-    outputs: Vec<OutletId>,
+    /// Custom outputs if different from model defaults, None means use model.outputs
+    custom_outputs: Option<Vec<OutletId>>,
     order: Vec<usize>,
     flush_lists: Vec<TVec<usize>>,
     has_unresolved_symbols: bool,
@@ -158,16 +160,31 @@ where
                 }
             }
         }
+        
+        // Only store custom_outputs if they differ from the model's default outputs
+        let model_outputs = model.borrow().output_outlets()?;
+        let custom_outputs = if outputs == model_outputs {
+            None
+        } else {
+            Some(outputs.to_vec())
+        };
+        
         Ok(SimplePlan {
             model,
             order,
             flush_lists,
-            outputs: outputs.to_vec(),
+            custom_outputs,
             has_unresolved_symbols: !symbols.is_empty(),
             _casper: PhantomData,
             executor: options.executor.clone(),
             session_handler: None,
         })
+    }
+
+    /// Get the plan's outputs - either custom outputs or the model's default outputs.
+    #[inline]
+    pub fn outputs(&self) -> &[OutletId] {
+        self.custom_outputs.as_deref().unwrap_or(&self.model.borrow().outputs)
     }
 
     pub fn order_without_consts(&self) -> &[usize] {
@@ -531,7 +548,7 @@ where
     pub fn outputs(&mut self) -> TractResult<TVec<TValue>> {
         let &mut SimpleState { ref plan, ref mut values, .. } = self;
         let mut v = tvec![];
-        for o in plan.borrow().outputs.iter() {
+        for o in plan.borrow().outputs().iter() {
             let vs = values[o.node].as_mut().ok_or_else(|| {
                 format_err!(
                     "Outputs of {:?} are not computed",
@@ -744,6 +761,400 @@ where
     }
 }
 
+// =============================================================================
+// Self-referential types using ouroboros for reduced cloning
+// =============================================================================
+
+/// Data computed from the model that is stored in the plan.
+#[derive(Clone, Debug)]
+pub struct PlanComputedData {
+    pub order: Vec<usize>,
+    pub flush_lists: Vec<TVec<usize>>,
+    pub has_unresolved_symbols: bool,
+    pub executor: Option<Executor>,
+    pub session_handler: Option<Arc<dyn SessionStateHandler + 'static>>,
+    /// Custom outputs if different from model defaults
+    pub custom_outputs: Option<Vec<OutletId>>,
+}
+
+/// References derived from the model, stored alongside it in the self-referential struct.
+pub struct ModelDerivedRefs<'a, F, O>
+where
+    F: Fact + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
+{
+    pub nodes: &'a [Node<F, O>],
+    pub inputs: &'a [OutletId],
+    pub outputs: &'a [OutletId],
+}
+
+/// A self-referential plan that owns the model and stores references to its internals.
+/// This avoids repeated `borrow()` calls and enables direct access to model data.
+#[self_referencing]
+pub struct OwnedSimplePlan<F, O>
+where
+    F: Fact + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
+{
+    /// The owned model
+    model: Graph<F, O>,
+    /// Computed plan data (not referencing model)
+    computed: PlanComputedData,
+    /// References into the model (self-referential)
+    #[borrows(model)]
+    #[covariant]
+    model_refs: ModelDerivedRefs<'this, F, O>,
+}
+
+impl<F, O> OwnedSimplePlan<F, O>
+where
+    F: Fact + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
+{
+    /// Create a new owned plan from a model.
+    pub fn new_owned(model: Graph<F, O>) -> TractResult<Self> {
+        Self::new_owned_with_options(model, &PlanOptions::default())
+    }
+
+    /// Create a new owned plan from a model with options.
+    pub fn new_owned_with_options(model: Graph<F, O>, options: &PlanOptions) -> TractResult<Self> {
+        let outputs = model.output_outlets()?.to_vec();
+        Self::build_owned(model, &outputs, &[], options)
+    }
+
+    /// Build an owned plan with custom outputs.
+    pub fn build_owned(
+        model: Graph<F, O>,
+        outputs: &[OutletId],
+        deps: &[(usize, usize)],
+        options: &PlanOptions,
+    ) -> TractResult<Self> {
+        let inputs_vec: Vec<usize> = model.input_outlets()?.iter().map(|n| n.node).collect();
+        let outputs_nodes: Vec<usize> = outputs.iter().map(|n| n.node).collect();
+
+        let mut order = if options.skip_order_opt_ram {
+            eval_order_for_nodes(model.nodes(), &inputs_vec, &outputs_nodes, deps)?
+        } else {
+            eval_order_opt_ram_for_nodes(model.nodes(), &inputs_vec, &outputs_nodes, deps)?
+        };
+        order.retain(|node| !model.node(*node).op_is::<Const>());
+
+        let flush_lists = build_flush_list(&model, &order, outputs, |n| !n.op_is::<Const>());
+
+        #[allow(clippy::mutable_key_type)]
+        let mut symbols: std::collections::HashSet<Symbol> = Default::default();
+        for node in &model.nodes {
+            for output in &node.outputs {
+                if let Ok(fact) = output.fact.to_typed_fact() {
+                    symbols.extend(fact.shape.iter().flat_map(|d| d.symbols()))
+                }
+            }
+        }
+
+        let model_outputs = model.output_outlets()?;
+        let custom_outputs = if outputs == model_outputs { None } else { Some(outputs.to_vec()) };
+
+        let computed = PlanComputedData {
+            order,
+            flush_lists,
+            has_unresolved_symbols: !symbols.is_empty(),
+            executor: options.executor.clone(),
+            session_handler: None,
+            custom_outputs,
+        };
+
+        Ok(OwnedSimplePlanBuilder {
+            model,
+            computed,
+            model_refs_builder: |m: &Graph<F, O>| ModelDerivedRefs {
+                nodes: &m.nodes,
+                inputs: &m.inputs,
+                outputs: &m.outputs,
+            },
+        }
+        .build())
+    }
+
+    /// Get the execution order (excluding constants).
+    #[inline]
+    pub fn order(&self) -> &[usize] {
+        &self.borrow_computed().order
+    }
+
+    /// Get the flush lists.
+    #[inline]
+    pub fn flush_lists(&self) -> &[TVec<usize>] {
+        &self.borrow_computed().flush_lists
+    }
+
+    /// Get the outputs (custom or model default).
+    #[inline]
+    pub fn outputs(&self) -> &[OutletId] {
+        self.borrow_computed()
+            .custom_outputs
+            .as_deref()
+            .unwrap_or(self.borrow_model_refs().outputs)
+    }
+
+    /// Get the inputs.
+    #[inline]
+    pub fn inputs(&self) -> &[OutletId] {
+        self.borrow_model_refs().inputs
+    }
+
+    /// Get the nodes.
+    #[inline]
+    pub fn nodes(&self) -> &[Node<F, O>] {
+        self.borrow_model_refs().nodes
+    }
+
+    /// Get a specific node.
+    #[inline]
+    pub fn node(&self, id: usize) -> &Node<F, O> {
+        &self.borrow_model_refs().nodes[id]
+    }
+
+    /// Check if plan has unresolved symbols.
+    #[inline]
+    pub fn has_unresolved_symbols(&self) -> bool {
+        self.borrow_computed().has_unresolved_symbols
+    }
+
+    /// Get the executor.
+    #[inline]
+    pub fn executor(&self) -> Option<&Executor> {
+        self.borrow_computed().executor.as_ref()
+    }
+
+    /// Get the session handler.
+    #[inline]
+    pub fn session_handler(&self) -> Option<&Arc<dyn SessionStateHandler + 'static>> {
+        self.borrow_computed().session_handler.as_ref()
+    }
+
+    /// Run the plan with inputs.
+    pub fn run(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let mut state = OwnedSimpleState::new_from_plan(self)?;
+        state.run(inputs)
+    }
+}
+
+/// State data that can be stored alongside the plan.
+pub struct StateData {
+    pub states: Vec<Option<Box<dyn OpState>>>,
+    pub session_state: SessionState,
+    pub values: Vec<Option<TVec<TValue>>>,
+}
+
+/// A self-referential state that holds a reference to an OwnedSimplePlan.
+pub struct OwnedSimpleState<'plan, F, O>
+where
+    F: Fact + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
+{
+    plan: &'plan OwnedSimplePlan<F, O>,
+    pub states: Vec<Option<Box<dyn OpState>>>,
+    pub session_state: SessionState,
+    pub values: Vec<Option<TVec<TValue>>>,
+}
+
+impl<'plan, F, O> OwnedSimpleState<'plan, F, O>
+where
+    F: Fact + Clone + 'static,
+    O: Debug + Display + AsRef<dyn Op> + AsMut<dyn Op> + Clone + 'static,
+{
+    /// Create a new state from a plan reference.
+    pub fn new_from_plan(plan: &'plan OwnedSimplePlan<F, O>) -> TractResult<Self> {
+        let num_nodes = plan.nodes().len();
+        let values = vec![None; num_nodes];
+        let session = SessionState::default();
+        let states: Vec<Option<Box<dyn OpState>>> = vec![None; num_nodes];
+
+        let mut state = OwnedSimpleState { plan, states, session_state: session, values };
+        state.populate_consts();
+        state.reset_op_states()?;
+        Ok(state)
+    }
+
+    fn populate_consts(&mut self) {
+        for node in self.plan.nodes() {
+            if let Some(k) = node.op_as::<Const>() {
+                self.values[node.id] = Some(tvec!(k.val().clone().into_tvalue()));
+            }
+        }
+    }
+
+    /// Reset op inner state.
+    pub fn reset_op_states(&mut self) -> TractResult<()> {
+        for (ix, n) in self.plan.nodes().iter().enumerate() {
+            self.states[ix] = if n.op().is_stateless() {
+                None
+            } else {
+                n.op().state(&mut self.session_state, ix)?
+            };
+        }
+        Ok(())
+    }
+
+    /// Reset wires state.
+    pub fn reset_turn(&mut self) -> TractResult<()> {
+        for node in self.plan.order() {
+            self.values[*node] = None;
+        }
+        self.session_state.resolved_symbols = SymbolValues::default();
+        Ok(())
+    }
+
+    pub fn run(&mut self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        self.set_inputs(inputs)?;
+        self.exec()?;
+        let outputs = self.take_outputs()?;
+        self.reset_turn()?;
+        Ok(outputs)
+    }
+
+    pub fn exec(&mut self) -> TractResult<()> {
+        if let Some(executor) = self.plan.executor() {
+            tract_linalg::multithread::multithread_tract_scope(executor.clone(), || {
+                self.do_exec()
+            })
+        } else {
+            self.do_exec()
+        }
+    }
+
+    fn do_exec(&mut self) -> TractResult<()> {
+        self.plan
+            .session_handler()
+            .map(|it| it.before_plan_eval(&mut self.session_state))
+            .transpose()?;
+
+        let nodes = self.plan.nodes();
+        let order = self.plan.order();
+        let flush_lists = self.plan.flush_lists();
+        let has_unresolved_symbols = self.plan.has_unresolved_symbols();
+
+        for (step, n) in order.iter().enumerate() {
+            let node = &nodes[*n];
+            trace!("Running step {step}, node {node}");
+
+            let mut inputs: TVec<TValue> = tvec![];
+            for i in &node.inputs {
+                trace!("  use input {i:?}");
+                let prec_node = &nodes[i.node];
+                let prec = self.values[i.node].as_ref().ok_or_else(|| {
+                    format_err!("Computing {}, precursor {} not done:", node, prec_node)
+                })?;
+                inputs.push(prec[i.slot].clone())
+            }
+
+            for flush in &flush_lists[step] {
+                trace!("  Ran {} can now flush {}", node, nodes[*flush]);
+                self.values[*flush] = None;
+            }
+
+            let vs = eval(&mut self.session_state, self.states[node.id].as_deref_mut(), node, inputs)?;
+
+            if has_unresolved_symbols {
+                for (o, v) in node.outputs.iter().zip(vs.iter()) {
+                    if let Ok(f) = o.fact.to_typed_fact() {
+                        for (dim_abstract, dim_concrete) in f.shape.iter().zip(v.shape()) {
+                            Self::resolve(&mut self.session_state, dim_abstract, *dim_concrete as i64)?;
+                        }
+                    }
+                }
+            }
+
+            self.values[node.id] = Some(vs);
+        }
+
+        self.plan
+            .session_handler()
+            .map(|it| it.after_plan_eval(&mut self.session_state))
+            .transpose()?;
+
+        Ok(())
+    }
+
+    fn resolve(state: &mut SessionState, expression: &TDim, provided: i64) -> TractResult<()> {
+        let expected = expression.eval(&state.resolved_symbols);
+        if let Ok(x) = expected.to_i64() {
+            if x != provided {
+                bail!("Clashing resolution for expression. {expression}={x} != {provided}. ({state:?})")
+            }
+        }
+        if expected.symbols().len() == 1 {
+            let sym = expected.symbols().into_iter().next().unwrap();
+            if let Some(v) = solve_for(&sym, &expected, &provided.to_dim()) {
+                debug!("Determined symbol {sym}={v}");
+                state.resolved_symbols.set(&sym, v.to_i64().unwrap());
+            }
+            if state.scenario.is_none() {
+                let scope = sym
+                    .scope()
+                    .with_context(|| format!("Symbol {sym:?} points to an invalid (dead ?) SymbolScope. Make sure to create symbols using the model-managed SymbolScope."))?;
+                state.scenario = scope.guess_scenario(&state.resolved_symbols)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_inputs(&mut self, inputs: TVec<TValue>) -> TractResult<()> {
+        let plan_inputs = self.plan.inputs();
+        ensure!(
+            inputs.len() == plan_inputs.len(),
+            "Wrong number of inputs for model. Expected {} got {}",
+            plan_inputs.len(),
+            inputs.len()
+        );
+
+        for (ix, t) in inputs.into_iter().enumerate() {
+            self.set_input(ix, t)?
+        }
+        Ok(())
+    }
+
+    pub fn set_input(&mut self, input: usize, t: TValue) -> TractResult<()> {
+        let outlet: OutletId = self.plan.inputs()[input];
+        let nodes = self.plan.nodes();
+        let node = &nodes[outlet.node];
+        let fact = &node.outputs[outlet.slot].fact;
+
+        if let Ok(typed_fact) = fact.to_typed_fact() {
+            for (expected, provided) in typed_fact.shape.iter().zip(t.shape()) {
+                Self::resolve(&mut self.session_state, expected, *provided as i64)?;
+            }
+        }
+
+        ensure!(
+            fact.matches(&t, Some(&self.session_state.resolved_symbols))
+                .with_context(|| format!("Setting input {input}"))?,
+            "Input at index {input} has incorrect dtype or shape (got {t:?}, expected to match fact {fact:?})",
+        );
+        self.session_state.inputs.insert(outlet.node, t);
+        Ok(())
+    }
+
+    pub fn take_outputs(&mut self) -> TractResult<TVec<TValue>> {
+        let outputs = self.plan.outputs();
+        let nodes = self.plan.nodes();
+        let mut v = tvec![];
+        for o in outputs.iter() {
+            let vs = self.values[o.node].as_mut().ok_or_else(|| {
+                format_err!("Outputs of {:?} are not computed", &nodes[o.node])
+            })?;
+            v.push(vs[o.slot].clone())
+        }
+        Ok(v)
+    }
+
+    /// Get the plan reference.
+    #[inline]
+    pub fn plan(&self) -> &OwnedSimplePlan<F, O> {
+        self.plan
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -773,5 +1184,15 @@ mod test {
     #[test]
     fn frozen_type_state_is_send() {
         is_send::<TypedFrozenSimpleState<TypedModel, TypedSimplePlan<TypedModel>>>();
+    }
+
+    #[test]
+    fn owned_plan_is_send() {
+        is_send::<TypedOwnedSimplePlan>();
+    }
+
+    #[test]
+    fn owned_plan_is_sync() {
+        is_sync::<TypedOwnedSimplePlan>();
     }
 }
