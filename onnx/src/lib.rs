@@ -19,7 +19,9 @@ pub mod pb {
 }
 
 pub mod data_resolver;
+pub mod linear_classifier_processor;
 pub mod pb_helpers;
+pub mod softmax;
 pub mod tensor;
 
 pub use model::Onnx;
